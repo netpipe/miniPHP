@@ -1,5 +1,8 @@
 # miniPHP
 a minature version of PHP
+
+ echo, variables, scalars, arrays ([] and array()), arithmetic, concatenation, comparisons, if/elseif/else, while, for, user functions, return, and several builtins.
+
 WIP untested
 
 comming soon CGI support with
