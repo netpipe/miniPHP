@@ -5,10 +5,27 @@ echo, variables, scalars, arrays ([] and array()), arithmetic, concatenation, co
  
 WIP untested<br>
 
-comming soon CGI support with<br>
-inline HTML<br>
-POST forms<br>
-array sessions<br>
-output buffering<br>
-escaping helpers<br>
-better cookie/header handling
+still lacks many things: classes, exceptions, foreach, include, multipart/form-data, file uploads, robust locking, full standard library, etc. But it is a reasonably complete little CGI/session-capable PHP-like runtime in one C file.
+
+CGI mode<br>
+?a=test query parsing<br>
+$_GET<br>
+$_POST (application/x-www-form-urlencoded)<br>
+$_COOKIE<br>
+$_SESSION<br>
+$_SERVER<br>
+$_REQUEST<br>
+session_start()<br>
+session_destroy()
+header()
+setcookie()
+output buffering for CGI
+file-backed sessions
+inline HTML outside <?php ... ?>
+<?= $expr ?>
+htmlspecialchars()
+urlencode() / urldecode()
+
+
+
+REQUEST_METHOD=GET QUERY_STRING=a=test ./phpmini_web index.php
