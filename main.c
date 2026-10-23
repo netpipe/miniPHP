@@ -10,6 +10,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <signal.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include <fcntl.h>
 
@@ -94,7 +97,7 @@ typedef struct Var {
 
 typedef struct Env {
     Var* vars;
-    Env* parent;
+    struct Env* parent;   /* the typedef is not complete yet inside its own body */
 } Env;
 
 typedef struct Token {
@@ -148,6 +151,45 @@ static char* lower_dup(const char* s);
 static char* case_dup(const char* s, int up);
 
 static Node* parse_expr(void);
+static Node* parse_statement(void);   /* used by parse_block before it is defined */
+static Node* parse_unary(void);       /* recursive; wrapped with a depth limit */
+
+/* AUDIT: a stack guard instead of recursion counters.
+   The parser and the evaluator are both recursive, so a script nested deeply
+   enough -- 200,000 parentheses, or a function that calls itself forever --
+   ran off the end of the C stack and the process died with SIGSEGV. Under CGI
+   that is one request killing its worker with no message.
+   Counting levels does not bound it: a call level and a bracket level cost
+   different amounts of stack, they COMBINE (a recursive call inside a deeply
+   nested expression stacks both), and a sanitizer build's frames are several
+   times larger again. So this measures the stack itself -- the same approach
+   PHP 8.3 takes with zend.max_allowed_stack_size -- and stops with a normal
+   error while there is still a safe margin left. */
+static uintptr_t stack_base = 0;
+static size_t stack_budget = 0;
+
+static void stack_guard_init(void* base) {
+    struct rlimit rl;
+    size_t total = (size_t)8 << 20;                     /* the usual default */
+    if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > 0)
+        total = (size_t)rl.rlim_cur;
+    stack_base = (uintptr_t)base;
+    /* keep a quarter of the stack (at least 256 KB) as headroom for the
+       frames between one check and the next, and for the error path */
+    size_t keep = total / 4;
+    if (keep < ((size_t)256 << 10)) keep = (size_t)256 << 10;
+    stack_budget = total > keep ? total - keep : total / 2;
+}
+
+static void stack_guard(void) {
+    /* The FRAME address, not the address of a local: under AddressSanitizer
+       locals can live on a heap "fake stack", which would make a local's
+       address meaningless as a depth measurement. */
+    uintptr_t p = (uintptr_t)__builtin_frame_address(0);
+    if (stack_base && p < stack_base && stack_base - p > stack_budget)
+        fatal("Maximum call stack size of %zu bytes reached. Infinite recursion?",
+              stack_budget);
+}
 static Value* eval(Node* n, Env* env);
 static void exec(Node* n, Env* env);
 static void exec_list(NodeList* l, Env* env);
@@ -200,12 +242,19 @@ static void buf_init(Buf* b) {
 }
 
 static void buf_reserve(Buf* b, size_t extra) {
-    if (!b->cap) b->cap = 64;
-    while (b->len + extra + 1 > b->cap) {
-        b->cap *= 2;
-        b->data = realloc(b->data, b->cap);
-        if (!b->data) fatal("out of memory");
-    }
+    /* AUDIT: this used to set cap = 64 on an empty buffer WITHOUT allocating,
+       so the grow loop below saw "64 is plenty" and never called realloc.
+       data stayed NULL and the first byte written went to address 0. Every
+       Buf in the interpreter starts empty, so this crashed on the first
+       character of every script. Allocate whenever there is no storage. */
+    size_t need = b->len + extra + 1;
+    if (b->data && need <= b->cap) return;
+    size_t cap = b->cap ? b->cap : 64;
+    while (cap < need) cap *= 2;
+    char* p = realloc(b->data, cap);
+    if (!p) fatal("out of memory");
+    b->data = p;
+    b->cap = cap;
 }
 
 static void buf_add(Buf* b, const char* s, size_t n) {
@@ -961,7 +1010,7 @@ static Node* parse_simple_stmt(void) {
     return n;
 }
 
-static Node* parse_statement(void) {
+static Node* parse_statement_inner(void) {
     switch (cur.type) {
         case TK_SEMI: {
             adv();
@@ -1076,6 +1125,11 @@ static Node* parse_statement(void) {
             return n;
         }
     }
+}
+
+static Node* parse_statement(void) {
+    stack_guard();
+    return parse_statement_inner();
 }
 
 static NodeList* parse_program(void) {
@@ -1198,11 +1252,16 @@ static Node* parse_postfix(void) {
     return e;
 }
 
-static Node* parse_unary(void) {
+static Node* parse_unary_inner(void) {
     if (match(TK_BANG)) return new_unop(OP_NOT, parse_unary());
     if (match(TK_MINUS)) return new_unop(OP_NEG, parse_unary());
     if (match(TK_PLUS)) return new_unop(OP_POS, parse_unary());
     return parse_postfix();
+}
+
+static Node* parse_unary(void) {
+    stack_guard();
+    return parse_unary_inner();
 }
 
 static Node* parse_multiplicative(void) {
@@ -1273,8 +1332,13 @@ static Node* parse_or(void) {
     return l;
 }
 
-static Node* parse_expr(void) {
+static Node* parse_expr_inner(void) {
     return parse_or();
+}
+
+static Node* parse_expr(void) {
+    stack_guard();
+    return parse_expr_inner();
 }
 
 static Value* v_new(int type) {
@@ -1472,12 +1536,20 @@ static int val_is_numeric(Value* v) {
     return 0;
 }
 
+/* AUDIT: casting a double outside long long's range (1e300, INF, NAN) to
+   long long is undefined behaviour. Anything that does not fit becomes 0. */
+static long long double_to_ll(double d) {
+    if (!(d == d)) return 0;                                  /* NaN */
+    if (d >= 9223372036854775807.0 || d < -9223372036854775808.0) return 0;
+    return (long long)d;
+}
+
 static long long val_to_int(Value* v) {
     if (!v) return 0;
 
     switch (v->type) {
         case T_INT: return v->i;
-        case T_FLOAT: return (long long)v->d;
+        case T_FLOAT: return double_to_ll(v->d);
         case T_BOOL: return v->b;
         case T_STRING: return strtoll(v->s ? v->s : "", 0, 10);
         case T_ARRAY: return 1;
@@ -1602,6 +1674,17 @@ static int val_cmp(Value* a, Value* b) {
     return 0;
 }
 
+/* AUDIT: % on integers, made safe.
+   - y == 0 used to return 0 silently; PHP 8 raises "Modulo by zero".
+   - LLONG_MIN % -1 is undefined in C, and on x86 it is a HARDWARE TRAP
+     (SIGFPE): one expression in a script killed the whole process. The
+     mathematical answer is 0, which is what PHP gives. */
+static long long int_mod(long long x, long long y) {
+    if (y == 0) fatal("Modulo by zero");
+    if (y == -1) return 0;
+    return x % y;
+}
+
 static Value* arith(int op, Value* a, Value* b) {
     if (op == OP_CONCAT) {
         char* sa = val_to_string(a);
@@ -1629,13 +1712,17 @@ static Value* arith(int op, Value* a, Value* b) {
     int both_int = a && b && a->type == T_INT && b->type == T_INT;
 
     if (both_int && op != OP_DIV) {
-        long long x = a->i, y = b->i;
+        long long x = a->i, y = b->i, r;
 
+        /* AUDIT: integer + - * used to overflow with undefined behaviour
+           (PHP_INT_MAX + 1). PHP's rule is that an int result which does not
+           fit becomes a float, so on overflow this falls through to the
+           floating-point path below instead of wrapping. */
         switch (op) {
-            case OP_ADD: return v_int(x + y);
-            case OP_SUB: return v_int(x - y);
-            case OP_MUL: return v_int(x * y);
-            case OP_MOD: return v_int(y == 0 ? 0 : x % y);
+            case OP_ADD: if (!__builtin_add_overflow(x, y, &r)) return v_int(r); break;
+            case OP_SUB: if (!__builtin_sub_overflow(x, y, &r)) return v_int(r); break;
+            case OP_MUL: if (!__builtin_mul_overflow(x, y, &r)) return v_int(r); break;
+            case OP_MOD: return v_int(int_mod(x, y));
             default: break;
         }
     }
@@ -1647,12 +1734,15 @@ static Value* arith(int op, Value* a, Value* b) {
         case OP_ADD: return v_float(x + y);
         case OP_SUB: return v_float(x - y);
         case OP_MUL: return v_float(x * y);
-        case OP_DIV: return v_float(y == 0.0 ? 0.0 : x / y);
-        case OP_MOD: {
-            long long ix = (long long)x;
-            long long iy = (long long)y;
-            return v_int(iy == 0 ? 0 : ix % iy);
-        }
+        /* AUDIT: x / 0 used to return 0 silently. PHP 8 raises
+           DivisionByZeroError, which uncaught is a fatal error -- and with no
+           exceptions in this runtime, fatal is the faithful equivalent. A
+           silent 0 lets a bad calculation carry on into whatever it feeds. */
+        case OP_DIV:
+            if (y == 0.0) fatal("Division by zero");
+            return v_float(x / y);
+        case OP_MOD:
+            return v_int(int_mod(double_to_ll(x), double_to_ll(y)));
         default:
             fatal("Bad arithmetic operator");
             return v_null();
@@ -1687,7 +1777,11 @@ static Value* eval_unop(int op, Value* a) {
     switch (op) {
         case OP_NOT: return v_bool(!val_truthy(a));
         case OP_NEG:
-            if (a && a->type == T_INT) return v_int(-a->i);
+            /* AUDIT: -PHP_INT_MIN overflows; PHP gives a float. */
+            if (a && a->type == T_INT) {
+                if (a->i == (-9223372036854775807LL - 1)) return v_float(9223372036854775808.0);
+                return v_int(-a->i);
+            }
             if (a && a->type == T_FLOAT) return v_float(-a->d);
             return v_float(-val_to_double(a));
         case OP_POS:
@@ -1830,6 +1924,7 @@ static int parse_dd(const char** pp, const char* end, double* out) {
 }
 
 static Value* parse_ser(const char** pp, const char* end) {
+    stack_guard();     /* AUDIT: nested arrays in a corrupt file recurse here */
     skip_ws(pp, end);
     if (*pp >= end) return v_null();
 
@@ -1869,7 +1964,10 @@ static Value* parse_ser(const char** pp, const char* end) {
         else return v_null();
 
         if (len < 0) len = 0;
-        if (*pp + len > end) len = (long long)(end - *pp);
+        /* AUDIT: compare lengths, not pointers. `*pp + len` with a huge len
+           from a corrupt file overflows the pointer, which is undefined
+           behaviour before the comparison even runs. */
+        if (len > (long long)(end - *pp)) len = (long long)(end - *pp);
 
         char* s = malloc((size_t)len + 1);
         if (!s) fatal("out of memory");
@@ -1890,11 +1988,20 @@ static Value* parse_ser(const char** pp, const char* end) {
         if (!parse_ll(pp, end, &cnt)) return v_null();
         if (cnt < 0) cnt = 0;
 
+        /* AUDIT: ser_value writes "a:<count>:{" -- a colon BEFORE the brace --
+           but this expected the brace straight after the count. Every array
+           failed to parse, so load_session_file got null and $_SESSION came
+           back EMPTY on every request after the first. Sessions have never
+           carried anything from one request to the next. */
+        if (*pp < end && **pp == ':') (*pp)++;
         if (!eat(pp, end, '{')) return v_null();
 
         Value* arr = v_new(T_ARRAY);
 
-        for (long long i = 0; i < cnt; i++) {
+        /* AUDIT: the count comes from the file. "a:999999999999:{" used to
+           spin for that many iterations after the data ran out; stop at the
+           end of the input instead of trusting the number. */
+        for (long long i = 0; i < cnt && *pp < end; i++) {
             Value* k = parse_ser(pp, end);
             Value* val = parse_ser(pp, end);
             array_put(arr, k, val);
@@ -1959,6 +2066,19 @@ static int header_name_eq(const char* a, const char* b) {
 
 static void add_response_header_ex(const char* line, int replace) {
     if (!line) return;
+
+    /* AUDIT: header injection. A CR or LF inside a header line used to be
+       written straight into the response, so header("Location: " . $_GET[...])
+       let a visitor add their own headers -- set cookies in someone else's
+       browser, or split the response in two. setcookie() goes through here
+       too, and its path/domain/samesite options were not encoded either.
+       PHP has refused this since 5.1.2 with the same rule: drop the header,
+       warn, carry on. */
+    if (strpbrk(line, "\r\n")) {
+        fprintf(stderr, "PHP warning: header may not contain more than a single header, "
+                        "new line detected\n");
+        return;
+    }
 
     if (strncasecmp(line, "HTTP/", 5) == 0) {
         const char* sp = strchr(line, ' ');
@@ -2112,8 +2232,29 @@ static const char* session_dir(void) {
     return (d && *d) ? d : "/tmp/phpmini-sessions";
 }
 
-static void ensure_session_dir(void) {
-    mkdir(session_dir(), 0700);
+/* AUDIT: the session directory defaults to /tmp, which every account on the
+   machine can write. mkdir() used to be called and its result ignored, so if
+   someone else had created /tmp/phpmini-sessions first, sessions were quietly
+   written into a directory THEY own -- readable by them, and open to the
+   symlink trick below. Now the directory must be a real directory (not a
+   link), owned by us, and closed to group and others; if it is not, sessions
+   are refused with a message rather than written somewhere unsafe. */
+static int session_dir_trusted(void) {
+    const char* d = session_dir();
+    mkdir(d, 0700);
+
+    struct stat st;
+    if (lstat(d, &st) != 0) return 0;
+    if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "PHP warning: session path %s is not a directory; sessions disabled\n", d);
+        return 0;
+    }
+    if (st.st_uid != geteuid() || (st.st_mode & 077)) {
+        fprintf(stderr, "PHP warning: session path %s is not private to this user "
+                        "(owner/permissions); sessions disabled\n", d);
+        return 0;
+    }
+    return 1;
 }
 
 static int valid_session_id(const char* s) {
@@ -2140,12 +2281,13 @@ static void gen_sid(char* out, size_t n) {
         close(fd);
     }
 
-    if (r != (ssize_t)sizeof raw) {
-        unsigned seed = (unsigned)time(0) ^ (unsigned)getpid() ^ (unsigned)rand();
-        srand(seed);
-        for (size_t i = 0; i < sizeof raw; i++)
-            raw[i] = (unsigned char)(rand() & 255);
-    }
+    /* AUDIT: this used to fall back to rand() seeded with time ^ pid when
+       /dev/urandom could not be read. Those are guessable -- the time is
+       public and pids are small -- and a guessable session ID is a stolen
+       login. With no good randomness there is no safe ID to issue, so fail
+       like PHP does ("Failed to create session ID") instead of issuing one. */
+    if (r != (ssize_t)sizeof raw)
+        fatal("Failed to create session ID: /dev/urandom unavailable");
 
     for (size_t i = 0; i < sizeof raw; i++)
         sprintf(out + (i * 2), "%02x", raw[i]);
@@ -2161,8 +2303,10 @@ static void load_session_file(const char* sid) {
     char path[1024];
     session_file_path(path, sizeof path, sid);
 
-    FILE* f = fopen(path, "rb");
-    if (!f) return;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return;
+    FILE* f = fdopen(fd, "rb");
+    if (!f) { close(fd); return; }
 
     char* data = read_all(f);
     fclose(f);
@@ -2182,7 +2326,7 @@ static void save_session_file(void) {
     if (!valid_session_id(session_id)) return;
 
     session_saved = 1;
-    ensure_session_dir();
+    if (!session_dir_trusted()) return;
 
     char path[1024];
     session_file_path(path, sizeof path, session_id);
@@ -2191,12 +2335,39 @@ static void save_session_file(void) {
     buf_init(&b);
     ser_value(&b, V_SESSION);
 
-    FILE* f = fopen(path, "wb");
-    if (f) {
-        if (b.data && b.len)
-            fwrite(b.data, 1, b.len, f);
-        fclose(f);
+    /* AUDIT: fopen(path, "wb") followed symlinks and created the file 0644.
+       Demonstrated before this fix: with a link planted at sess_<id> and that
+       id sent as the cookie, saving the session OVERWROTE the file the link
+       pointed to. And 0644 meant every account on the machine could read
+       every session. O_NOFOLLOW refuses the link; 0600 keeps it private. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "PHP warning: could not write session file %s\n", path);
+        free(b.data);
+        return;
     }
+    FILE* f = fdopen(fd, "wb");
+    if (!f) { close(fd); free(b.data); return; }
+    if (b.data && b.len)
+        fwrite(b.data, 1, b.len, f);
+    fclose(f);
+    free(b.data);
+}
+
+/* A session file exists for this id: a regular file, not a link. */
+static int session_file_exists(const char* sid) {
+    char path[1024];
+    session_file_path(path, sizeof path, sid);
+    struct stat st;
+    return lstat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+/* The request arrived over TLS, as the web server reports it. */
+static int request_is_https(void) {
+    const char* h = getenv("HTTPS");
+    if (h && *h && strcasecmp(h, "off") != 0) return 1;
+    const char* sch = getenv("REQUEST_SCHEME");
+    return sch && strcasecmp(sch, "https") == 0;
 }
 
 static void session_start_impl(void) {
@@ -2205,16 +2376,28 @@ static void session_start_impl(void) {
 
     if (!cgi_mode) return;
 
+    /* Untrusted storage: $_SESSION still works for this request, but nothing
+       is read from or written to a directory someone else controls. */
+    if (!session_dir_trusted()) return;
+
     ArrayItem* it = array_find(V_COOKIE, v_str("PHPSESSID"));
     char* sid = it ? val_to_string(it->val) : xstrdup("");
 
-    if (valid_session_id(sid)) {
+    /* AUDIT: strict mode. Any well-formed id from the cookie used to be
+       adopted, even one this server never issued -- so a visitor could pick
+       the id (session fixation), and choosing it in advance is what made the
+       symlink overwrite aimable. An id with no session behind it is now
+       replaced with a fresh one, which is PHP's session.use_strict_mode. */
+    if (valid_session_id(sid) && session_file_exists(sid)) {
         strncpy(session_id, sid, sizeof session_id - 1);
         session_id[sizeof session_id - 1] = 0;
         load_session_file(session_id);
     } else {
         gen_sid(session_id, sizeof session_id);
-        add_set_cookie_full("PHPSESSID", session_id, 0, "/", "", 0, 1, "Lax");
+        /* Secure when the request came over HTTPS, so the cookie is never
+           sent back in clear text. HttpOnly and SameSite=Lax as before. */
+        add_set_cookie_full("PHPSESSID", session_id, 0, "/", "",
+                            request_is_https(), 1, "Lax");
     }
 
     free(sid);
@@ -2277,14 +2460,44 @@ static void parse_urlencoded_pair(const char* s, size_t len, Value* dest) {
     free(pair);
 }
 
+/* AUDIT: max_input_vars.
+   Arrays here are linked lists, and every insert scans the whole list for a
+   duplicate key, so building $_GET / $_POST / $_COOKIE from N variables costs
+   O(N^2). Measured before this fix: a 629 KB POST of short distinct keys took
+   78 seconds of CPU, and the 2 MB the body limit allows works out at roughly
+   13 minutes per request -- a handful of requests pins every core. PHP defends
+   the same spot the same way, with max_input_vars (default 1000). Variables
+   past the limit are dropped and the request carries on. Override with
+   PHPMINI_MAX_INPUT_VARS. */
+static long max_input_vars(void) {
+    const char* e = getenv("PHPMINI_MAX_INPUT_VARS");
+    long n = (e && *e) ? strtol(e, 0, 10) : 1000;
+    return n > 0 ? n : 1000;
+}
+
+static int input_vars_ok(long* used, const char* what) {
+    if (*used < max_input_vars()) { (*used)++; return 1; }
+    if (*used == max_input_vars()) {
+        fprintf(stderr, "PHP warning: input variables exceeded %ld for %s; "
+                        "the rest were dropped (PHPMINI_MAX_INPUT_VARS)\n",
+                max_input_vars(), what);
+        (*used)++;                     /* warn once */
+    }
+    return 0;
+}
+
 static void parse_urlencoded_into(const char* s, Value* dest) {
     if (!s || !dest) return;
+    long used = 0;
 
     while (*s) {
         const char* amp = strchr(s, '&');
         size_t len = amp ? (size_t)(amp - s) : strlen(s);
 
-        if (len) parse_urlencoded_pair(s, len, dest);
+        if (len) {
+            if (!input_vars_ok(&used, "the query string or form body")) break;
+            parse_urlencoded_pair(s, len, dest);
+        }
 
         if (!amp) break;
         s = amp + 1;
@@ -2293,10 +2506,13 @@ static void parse_urlencoded_into(const char* s, Value* dest) {
 
 static void parse_cookies_into(const char* s, Value* dest) {
     if (!s || !dest) return;
+    long used = 0;
 
     while (*s) {
         const char* sc = strchr(s, ';');
         size_t len = sc ? (size_t)(sc - s) : strlen(s);
+
+        if (!input_vars_ok(&used, "cookies")) break;
 
         char* pair = trim_dup(s, len);
         char* eq = strchr(pair, '=');
@@ -2395,6 +2611,32 @@ static void web_atexit(void) {
     flush_response();
 }
 
+/* AUDIT: max_execution_time.
+   Nothing stopped a runaway script, so under CGI a single request with an
+   endless loop -- a bug, or a loop whose bound comes from the request --
+   pinned a CPU core until someone killed it by hand. PHP's web default is 30
+   seconds; same here, enforced by the kernel through a CPU-time limit so it
+   costs nothing while the script runs. CLI runs are left unlimited, as in PHP.
+   Override with PHPMINI_MAX_EXECUTION_TIME (seconds, 0 = unlimited). */
+static void on_cpu_limit(int sig) {
+    (void)sig;
+    static const char msg[] = "PHP error: Maximum execution time exceeded\n";
+    ssize_t w = write(2, msg, sizeof msg - 1);
+    (void)w;
+    _exit(1);
+}
+
+static void apply_execution_limit(void) {
+    const char* e = getenv("PHPMINI_MAX_EXECUTION_TIME");
+    long secs = (e && *e) ? strtol(e, 0, 10) : 30;
+    if (secs <= 0) return;
+    struct rlimit rl;
+    rl.rlim_cur = (rlim_t)secs;
+    rl.rlim_max = (rlim_t)secs + 5;        /* hard kill if the handler cannot run */
+    signal(SIGXCPU, on_cpu_limit);
+    setrlimit(RLIMIT_CPU, &rl);
+}
+
 static void web_bootstrap(Env* env) {
     V_GET = v_new(T_ARRAY);
     V_POST = v_new(T_ARRAY);
@@ -2411,6 +2653,7 @@ static void web_bootstrap(Env* env) {
     env_set(env, "_REQUEST", V_REQUEST);
 
     fill_server_globals();
+    if (cgi_mode) apply_execution_limit();
 
     parse_urlencoded_into(getenv("QUERY_STRING"), V_GET);
     parse_cookies_into(getenv("HTTP_COOKIE"), V_COOKIE);
@@ -2856,6 +3099,7 @@ static void set_index(Value* cont, Value* key, Value* val) {
 }
 
 static Value* eval(Node* n, Env* env) {
+    stack_guard();
     if (!n) return v_null();
 
     switch (n->type) {
@@ -2984,6 +3228,7 @@ static Value* call_user(Func* f, Value** args, int argc) {
         env_set(env, p->node->s, av);
     }
 
+    stack_guard();
     exec_list(f->body, env);
 
     Value* r = v_null();
@@ -2997,6 +3242,7 @@ static Value* call_user(Func* f, Value** args, int argc) {
 }
 
 static void exec(Node* n, Env* env) {
+    stack_guard();
     if (!n) return;
 
     switch (n->type) {
@@ -3088,6 +3334,8 @@ static void exec(Node* n, Env* env) {
 }
 
 int main(int argc, char** argv) {
+    stack_guard_init(__builtin_frame_address(0));
+
     FILE* f = stdin;
     int close_f = 0;
 
