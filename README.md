@@ -4,32 +4,30 @@ a minature version of PHP<br>
 echo, variables, scalars, arrays ([] and array()), arithmetic, concatenation, comparisons, if/elseif/else, while, for, foreach,user functions, return, and several builtins.<br>
 <br>
 still lacks many things: classes, exceptions, include, multipart/form-data, file uploads, robust locking, full standard library, etc. But it is a reasonably complete little CGI/session-capable PHP-like runtime in one C file.
-<br>
-planned future features include sqlite,file uploads,include, multipart/form-data <br>
-
-<br>
-CGI mode<br>
-?a=test query parsing<br>
-$_GET<br>
-$_POST (application/x-www-form-urlencoded)<br>
-$_COOKIE<br>
-$_SESSION<br>
-$_SERVER<br>
-$_REQUEST<br>
-session_start()<br>
-session_destroy()
-header()
-setcookie()
-output buffering for CGI
-file-backed sessions
-inline HTML outside <?php ... ?>
-<?= $expr ?>
-htmlspecialchars()
-urlencode() / urldecode()
-
-
 <br><br>
-REQUEST_METHOD=GET QUERY_STRING=a=test ./miniPHP index.php
+* planned future features include sqlite,file uploads,include, multipart/form-data <br>
+
+### CGI features
+* ?a=test query parsing<br>
+* _GET<br>
+* _POST (application/x-www-form-urlencoded)<br>
+* _COOKIE<br>
+* _SESSION<br>
+* _SERVER<br>
+* _REQUEST<br>
+* session_start()<br>
+* session_destroy()
+* header()
+* setcookie()
+* output buffering for CGI
+* file-backed sessions
+* inline HTML outside <?php ... ?>
+* /< ?= $expr ?>
+* htmlspecialchars()
+* urlencode() / urldecode()
+
+### testing
+REQUEST_METHOD=GET QUERY_STRING=a=test ./tests/miniPHP test.php
 <br><br>
-REQUEST_METHOD=GET ./miniPHP 'index.php?a=test'
+REQUEST_METHOD=GET ./miniPHP './tests/test.php?a=test'
 
