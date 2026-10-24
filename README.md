@@ -28,4 +28,7 @@ urlencode() / urldecode()
 
 
 
-REQUEST_METHOD=GET QUERY_STRING=a=test ./phpmini_web index.php
+REQUEST_METHOD=GET QUERY_STRING=a=test ./miniPHP index.php
+<br><br>
+REQUEST_METHOD=GET ./miniPHP 'index.php?a=test'
+
