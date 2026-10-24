@@ -5,7 +5,7 @@ echo, variables, scalars, arrays ([] and array()), arithmetic, concatenation, co
  
 WIP untested<br>
 
-still lacks many things: classes, exceptions, foreach, include, multipart/form-data, file uploads, robust locking, full standard library, etc. But it is a reasonably complete little CGI/session-capable PHP-like runtime in one C file.
+still lacks many things: classes, exceptions, include, multipart/form-data, file uploads, robust locking, full standard library, etc. But it is a reasonably complete little CGI/session-capable PHP-like runtime in one C file.
 
 CGI mode<br>
 ?a=test query parsing<br>
