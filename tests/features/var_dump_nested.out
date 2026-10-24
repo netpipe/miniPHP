@@ -1,0 +1,15 @@
+array(2) {
+  ["a"]=>
+  int(1)
+  [0]=>
+  array(4) {
+    [0]=>
+    bool(true)
+    [1]=>
+    NULL
+    [2]=>
+    float(1.5)
+    [3]=>
+    string(1) "s"
+  }
+}

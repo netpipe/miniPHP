@@ -13,6 +13,7 @@
 #include <sys/resource.h>
 #include <signal.h>
 #include <stdint.h>
+#include <limits.h>
 #include <sys/types.h>
 #include <fcntl.h>
 
@@ -23,13 +24,16 @@ enum {
 enum {
     NT_ECHO, NT_ASSIGN, NT_IF, NT_WHILE, NT_FOR, NT_FUNC, NT_RETURN, NT_EXPR,
     NT_INT, NT_FLOAT, NT_STR, NT_BOOL, NT_NULL, NT_VAR, NT_BINOP, NT_UNOP,
-    NT_CALL, NT_INDEX, NT_ARRAY
+    NT_CALL, NT_INDEX, NT_ARRAY,
+    NT_INCDEC, NT_TERNARY, NT_COALESCE, NT_BREAK, NT_CONTINUE,
+    NT_FOREACH, NT_UNSET
 };
 
 enum {
     OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_CONCAT,
     OP_EQ, OP_NEQ, OP_LT, OP_GT, OP_LE, OP_GE,
-    OP_SAME, OP_DIFF, OP_AND, OP_OR, OP_NOT, OP_NEG, OP_POS
+    OP_SAME, OP_DIFF, OP_AND, OP_OR, OP_NOT, OP_NEG, OP_POS,
+    OP_COALESCE                 /* ??= only; ?? itself is NT_COALESCE */
 };
 
 enum {
@@ -40,7 +44,9 @@ enum {
     TK_LT, TK_GT, TK_LE, TK_GE, TK_SAME, TK_DIFF,
     TK_LPAREN, TK_RPAREN, TK_LBRACE, TK_RBRACE, TK_LBRACK, TK_RBRACK,
     TK_ARROW, TK_BANG, TK_ANDAND, TK_OROR,
-    TK_PLUS, TK_MINUS, TK_STAR, TK_SLASH, TK_PERCENT, TK_UNKNOWN
+    TK_PLUS, TK_MINUS, TK_STAR, TK_SLASH, TK_PERCENT, TK_UNKNOWN,
+    TK_INC, TK_DEC, TK_OPASSIGN, TK_QUESTION, TK_COLON, TK_COALESCE,
+    TK_BREAK, TK_CONTINUE, TK_FOREACH, TK_AS
 };
 
 typedef struct Value Value;
@@ -121,6 +127,10 @@ typedef struct Header {
 static Func* funcs = 0;
 static Value* ret_val = 0;
 static int in_ret = 0;
+/* Pending `break N` / `continue N`: how many enclosing loops still have to
+   act on it. Like in_ret, a nonzero value stops exec_list early. */
+static long long brk_n = 0;
+static long long cont_n = 0;
 static Env* global_env = 0;
 
 static char* lex_src = 0;
@@ -146,6 +156,65 @@ static int session_saved = 0;
 static char session_id[129] = {0};
 
 static void fatal(const char* fmt, ...);
+
+/* AUDIT (follow-up): memory_limit.
+   Nothing bounded memory, and nothing is ever freed while a script runs, so a
+   trivial loop grew at ~900 MB per SECOND (measured). The 30 s CPU limit does
+   not help: the machine runs out of RAM long before that, and the kernel's
+   OOM killer may take the database or the web server with it.
+
+   So under CGI the process gets a memory_limit (256 MB by default) on top
+   of what it already uses at startup, enforced by the kernel through
+   RLIMIT_DATA. Every allocation in this file goes through the wrappers below,
+   so running out is PHP's "Allowed memory size exhausted" error instead of a
+   NULL pointer somewhere -- 21 allocation sites, several of which never
+   checked. Override with PHPMINI_MEMORY_LIMIT ("512M", "1G", 0 = unlimited).
+
+   Why 256 and not PHP's 128: PHP frees memory as it goes and this interpreter
+   never does -- every loop iteration costs ~500 bytes for good (measured).
+   At 128 MB an ordinary loop died at ~260,000 iterations; 256 MB allows
+   ~520,000. The real fix is memory management (reference counting), which
+   is a larger change than an audit should make. */
+static size_t mem_limit_bytes = 0;            /* 0 = no limit was applied */
+
+static void mem_exhausted(size_t want) {
+    static int in_error = 0;
+    if (in_error) {                    /* failed again while reporting: stop */
+        static const char m[] = "PHP error: out of memory\n";
+        ssize_t w = write(2, m, sizeof m - 1);
+        (void)w;
+        _exit(1);
+    }
+    in_error = 1;
+    if (mem_limit_bytes) {
+        /* raise the soft limit to the hard one, so the error path itself
+           (output flush, session save) has room to run */
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_DATA, &rl) == 0) { rl.rlim_cur = rl.rlim_max; setrlimit(RLIMIT_DATA, &rl); }
+        fatal("Allowed memory size of %zu bytes exhausted (tried to allocate %zu bytes)",
+              mem_limit_bytes, want);
+    }
+    fatal("Out of memory (tried to allocate %zu bytes)", want);
+}
+
+static void* mp_malloc(size_t n) {
+    void* p = malloc(n);
+    if (!p && n) mem_exhausted(n);
+    return p;
+}
+static void* mp_calloc(size_t a, size_t b) {
+    void* p = calloc(a, b);
+    if (!p && a && b) mem_exhausted(a * b);
+    return p;
+}
+static void* mp_realloc(void* q, size_t n) {
+    void* p = realloc(q, n);
+    if (!p && n) mem_exhausted(n);
+    return p;
+}
+#define malloc(n)     mp_malloc(n)
+#define calloc(a, b)  mp_calloc(a, b)
+#define realloc(q, n) mp_realloc(q, n)
 static char* xstrdup(const char* s);
 static char* lower_dup(const char* s);
 static char* case_dup(const char* s, int up);
@@ -153,6 +222,9 @@ static char* case_dup(const char* s, int up);
 static Node* parse_expr(void);
 static Node* parse_statement(void);   /* used by parse_block before it is defined */
 static Node* parse_unary(void);       /* recursive; wrapped with a depth limit */
+static int is_lvalue(Node* e);
+static Node* parse_postfix(void);
+static Node* new_incdec(Node* target, int delta, int prefix);
 
 /* AUDIT: a stack guard instead of recursion counters.
    The parser and the evaluator are both recursive, so a script nested deeply
@@ -165,6 +237,12 @@ static Node* parse_unary(void);       /* recursive; wrapped with a depth limit *
    times larger again. So this measures the stack itself -- the same approach
    PHP 8.3 takes with zend.max_allowed_stack_size -- and stops with a normal
    error while there is still a safe margin left. */
+/* How many loops enclose the statement being parsed, so `break` outside a
+   loop -- or `break 3` inside two -- is a parse error as in PHP, instead of
+   a flag that leaks out and stops some unrelated loop later. Reset to 0 for
+   a function body: a break cannot cross a call. */
+static int loop_depth = 0;
+
 static uintptr_t stack_base = 0;
 static size_t stack_budget = 0;
 
@@ -193,6 +271,8 @@ static void stack_guard(void) {
 static Value* eval(Node* n, Env* env);
 static void exec(Node* n, Env* env);
 static void exec_list(NodeList* l, Env* env);
+static void assign_to(Node* target, Value* val, Env* env);
+static long long array_next_index(Value* arr);
 static Value* call_user(Func* f, Value** args, int argc);
 static Value* builtin(const char* name, Value** args, int argc);
 
@@ -655,6 +735,10 @@ static Token lex_next(void) {
         else if (!strcmp(lw, "else")) tt = TK_ELSE;
         else if (!strcmp(lw, "while")) tt = TK_WHILE;
         else if (!strcmp(lw, "for")) tt = TK_FOR;
+        else if (!strcmp(lw, "break")) tt = TK_BREAK;
+        else if (!strcmp(lw, "foreach")) tt = TK_FOREACH;
+        else if (!strcmp(lw, "as")) tt = TK_AS;
+        else if (!strcmp(lw, "continue")) tt = TK_CONTINUE;
         else if (!strcmp(lw, "function")) tt = TK_FUNCTION;
         else if (!strcmp(lw, "return")) tt = TK_RETURN;
         else if (!strcmp(lw, "true")) tt = TK_TRUE;
@@ -861,6 +945,30 @@ static Token lex_next(void) {
         return t;
     }
 
+    /* ++ --, compound assignment, ?: and ?? -- checked before the single-
+       character switch below so "+=" never lexes as "+" then "=". The
+       operator behind a compound assignment travels in t.i. */
+    {
+        char n1 = (lex_pos + 1 < lex_len) ? lex_src[lex_pos + 1] : 0;
+        char n2 = (lex_pos + 2 < lex_len) ? lex_src[lex_pos + 2] : 0;
+
+        if (c == '+' && n1 == '+') { t.type = TK_INC; lex_pos += 2; return t; }
+        if (c == '-' && n1 == '-') { t.type = TK_DEC; lex_pos += 2; return t; }
+
+        if (n1 == '=' && strchr("+-*/.%", c)) {
+            t.type = TK_OPASSIGN;
+            t.i = c == '+' ? OP_ADD : c == '-' ? OP_SUB : c == '*' ? OP_MUL :
+                  c == '/' ? OP_DIV : c == '.' ? OP_CONCAT : OP_MOD;
+            lex_pos += 2;
+            return t;
+        }
+
+        if (c == '?' && n1 == '?' && n2 == '=') { t.type = TK_OPASSIGN; t.i = OP_COALESCE; lex_pos += 3; return t; }
+        if (c == '?' && n1 == '?') { t.type = TK_COALESCE; lex_pos += 2; return t; }
+        if (c == '?') { t.type = TK_QUESTION; lex_pos++; return t; }
+        if (c == ':') { t.type = TK_COLON; lex_pos++; return t; }
+    }
+
     switch (c) {
         case ';': t.type = TK_SEMI; lex_pos++; return t;
         case ',': t.type = TK_COMMA; lex_pos++; return t;
@@ -991,19 +1099,33 @@ static Node* parse_if(int is_elseif) {
     return n;
 }
 
+/* One parser for "expression or assignment", used by statements AND by the
+   init/step parts of for(). It used to exist twice, which is how compound
+   assignment would have ended up working in one place and not the other.
+   NT_ASSIGN: i = 0 plain, i = 1 compound with the operator in op. */
 static Node* parse_simple_stmt(void) {
     Node* e = parse_expr();
 
-    if (cur.type == TK_ASSIGN) {
+    if (cur.type == TK_ASSIGN || cur.type == TK_OPASSIGN) {
+        int compound = cur.type == TK_OPASSIGN;
+        int op = (int)cur.i;
         adv();
         Node* v = parse_expr();
-        if (e->type != NT_VAR && e->type != NT_INDEX) fatal("Invalid assignment");
+        if (!is_lvalue(e)) fatal("Invalid assignment");
+        /* ??= has to READ the target first, so $a[] ??= v is an error in PHP;
+           the arithmetic forms (+=, .= ...) append instead. */
+        if (compound && op == OP_COALESCE && e->type == NT_INDEX && !e->b)
+            fatal("Cannot use [] for reading");
 
         Node* n = new_node(NT_ASSIGN);
         n->a = e;
         n->b = v;
+        n->i = compound;
+        n->op = compound ? op : 0;
         return n;
     }
+
+    if (e->type == NT_INDEX && !e->b) fatal("Cannot use [] for reading");
 
     Node* n = new_node(NT_EXPR);
     n->a = e;
@@ -1043,7 +1165,9 @@ static Node* parse_statement_inner(void) {
             expect(TK_LPAREN, "(");
             Node* cond = parse_expr();
             expect(TK_RPAREN, ")");
+            loop_depth++;
             NodeList* body = parse_block();
+            loop_depth--;
 
             Node* n = new_node(NT_WHILE);
             n->a = cond;
@@ -1067,7 +1191,9 @@ static Node* parse_statement_inner(void) {
             if (cur.type != TK_RPAREN) upd = parse_simple_stmt();
             expect(TK_RPAREN, ")");
 
+            loop_depth++;
             NodeList* body = parse_block();
+            loop_depth--;
 
             Node* n = new_node(NT_FOR);
             n->a = init;
@@ -1087,7 +1213,10 @@ static Node* parse_statement_inner(void) {
 
             expect(TK_LPAREN, "(");
             n->l1 = parse_params();
+            int outer_loops = loop_depth;
+            loop_depth = 0;                 /* a break cannot cross a call */
             n->l2 = parse_block();
+            loop_depth = outer_loops;
             return n;
         }
 
@@ -1102,26 +1231,75 @@ static Node* parse_statement_inner(void) {
             return n;
         }
 
-        default: {
-            Node* e = parse_expr();
-
-            if (cur.type == TK_ASSIGN) {
-                adv();
-                Node* v = parse_expr();
-                expect(TK_SEMI, ";");
-
-                if (e->type != NT_VAR && e->type != NT_INDEX) fatal("Invalid assignment");
-
-                Node* n = new_node(NT_ASSIGN);
-                n->a = e;
-                n->b = v;
-                return n;
+        case TK_FOREACH: {
+            /* foreach ($arr as $v) / foreach ($arr as $k => $v). The targets
+               may be anything assignable, $a["x"] included, as in PHP. */
+            adv();
+            expect(TK_LPAREN, "(");
+            Node* src = parse_expr();
+            expect(TK_AS, "as");
+            if (cur.type == TK_UNKNOWN)          /* '&' lexes as unknown */
+                fatal("foreach by reference (&$v) is not supported");
+            Node* first = parse_postfix();
+            Node* key = 0;
+            Node* val = first;
+            if (match(TK_ARROW)) {
+                if (cur.type == TK_UNKNOWN) fatal("foreach by reference (&$v) is not supported");
+                key = first;
+                val = parse_postfix();
             }
+            if (!is_lvalue(val) || (key && !is_lvalue(key))) fatal("Cannot assign to this foreach target");
+            if ((val->type == NT_INDEX && !val->b) || (key && key->type == NT_INDEX && !key->b))
+                fatal("Cannot use [] for reading");
+            expect(TK_RPAREN, ")");
 
+            loop_depth++;
+            NodeList* body = parse_block();
+            loop_depth--;
+
+            Node* n = new_node(NT_FOREACH);
+            n->a = src;
+            n->b = key;
+            n->c = val;
+            n->l1 = body;
+            return n;
+        }
+
+        case TK_BREAK:
+        case TK_CONTINUE: {
+            int is_break = cur.type == TK_BREAK;
+            adv();
+            long long levels = 1;
+            if (cur.type == TK_INT) { levels = cur.i; adv(); }
             expect(TK_SEMI, ";");
 
-            Node* n = new_node(NT_EXPR);
-            n->a = e;
+            if (levels < 1) fatal("'%s' operator accepts only positive integers",
+                                  is_break ? "break" : "continue");
+            if (loop_depth == 0) fatal("'%s' not in the 'loop' context",
+                                       is_break ? "break" : "continue");
+            if (levels > loop_depth) fatal("Cannot '%s' %lld levels",
+                                           is_break ? "break" : "continue", levels);
+
+            Node* n = new_node(is_break ? NT_BREAK : NT_CONTINUE);
+            n->i = levels;
+            return n;
+        }
+
+        default: {
+            Node* n = parse_simple_stmt();
+            expect(TK_SEMI, ";");
+
+            /* unset() is a statement in PHP, not a function: it needs the
+               variable or element ITSELF, and a function call would only
+               receive its value. Recognised here and turned into NT_UNSET. */
+            if (n->type == NT_EXPR && n->a->type == NT_CALL && !strcasecmp(n->a->s, "unset")) {
+                for (NodeList* l = n->a->l1; l; l = l->next)
+                    if (!is_lvalue(l->node) || (l->node->type == NT_INDEX && !l->node->b))
+                        fatal("unset() can only remove a variable or an array element");
+                Node* u = new_node(NT_UNSET);
+                u->l1 = n->a->l1;
+                return u;
+            }
             return n;
         }
     }
@@ -1236,11 +1414,28 @@ static Node* parse_primary(void) {
     }
 }
 
+static int is_lvalue(Node* e) {
+    return e && (e->type == NT_VAR || e->type == NT_INDEX);
+}
+
+static Node* new_incdec(Node* target, int delta, int prefix) {
+    if (!is_lvalue(target)) fatal("Cannot increment or decrement this expression");
+    if (target->type == NT_INDEX && !target->b) fatal("Cannot use [] for reading");
+    Node* n = new_node(NT_INCDEC);
+    n->a = target;
+    n->op = delta;
+    n->i = prefix;
+    return n;
+}
+
 static Node* parse_postfix(void) {
     Node* e = parse_primary();
 
     while (match(TK_LBRACK)) {
-        Node* idx = parse_expr();
+        /* $a[] -- an append target. b stays NULL; reading through it is
+           rejected when it is evaluated, as PHP rejects it. */
+        Node* idx = 0;
+        if (cur.type != TK_RBRACK) idx = parse_expr();
         expect(TK_RBRACK, "]");
 
         Node* n = new_node(NT_INDEX);
@@ -1249,10 +1444,18 @@ static Node* parse_postfix(void) {
         e = n;
     }
 
+    if (cur.type == TK_INC || cur.type == TK_DEC) {
+        int delta = cur.type == TK_INC ? 1 : -1;
+        adv();
+        e = new_incdec(e, delta, 0);
+    }
+
     return e;
 }
 
 static Node* parse_unary_inner(void) {
+    if (match(TK_INC)) return new_incdec(parse_unary(), 1, 1);
+    if (match(TK_DEC)) return new_incdec(parse_unary(), -1, 1);
     if (match(TK_BANG)) return new_unop(OP_NOT, parse_unary());
     if (match(TK_MINUS)) return new_unop(OP_NEG, parse_unary());
     if (match(TK_PLUS)) return new_unop(OP_POS, parse_unary());
@@ -1332,8 +1535,32 @@ static Node* parse_or(void) {
     return l;
 }
 
+/* ?? binds tighter than ?: and is right-associative: a ?? b ?? c. */
+static Node* parse_coalesce(void) {
+    Node* l = parse_or();
+    if (match(TK_COALESCE)) {
+        Node* n = new_node(NT_COALESCE);
+        n->a = l;
+        n->b = parse_coalesce();
+        return n;
+    }
+    return l;
+}
+
+/* a ? b : c, and the short form a ?: c (b left NULL). Chains group to the
+   left, which is what PHP 7 did; PHP 8 refuses an unbracketed chain, so code
+   written for 8 already has the brackets and means the same thing here. */
 static Node* parse_expr_inner(void) {
-    return parse_or();
+    Node* e = parse_coalesce();
+    while (match(TK_QUESTION)) {
+        Node* n = new_node(NT_TERNARY);
+        n->a = e;
+        n->b = (cur.type == TK_COLON) ? 0 : parse_expr();
+        expect(TK_COLON, ":");
+        n->c = parse_coalesce();
+        e = n;
+    }
+    return e;
 }
 
 static Node* parse_expr(void) {
@@ -1461,6 +1688,15 @@ static int array_count(Value* arr) {
     return c;
 }
 
+/* Unlink one key. The item is not freed: nothing is freed while a script
+   runs, and a foreach over this array may still hold its pointers. */
+static void array_remove(Value* arr, Value* key) {
+    if (!arr || arr->type != T_ARRAY) return;
+    for (ArrayItem** pp = &arr->items; *pp; pp = &(*pp)->next) {
+        if (scalar_same((*pp)->key, key)) { *pp = (*pp)->next; return; }
+    }
+}
+
 static void array_clear(Value* arr) {
     if (arr && arr->type == T_ARRAY) arr->items = 0;
 }
@@ -1496,6 +1732,74 @@ static char* concat_str(const char* a, const char* b) {
     return r;
 }
 
+/* Floats formatted the way PHP prints them.
+   This used "%g", which keeps SIX significant digits: echo 1234567.89 printed
+   "1.23457e+06" and echo 1/3 printed "0.333333". PHP's echo uses 14
+   (precision), and var_dump uses the shortest form that reads back as the
+   same number (serialize_precision -1). PHP also writes the exponent its own
+   way: 1.0E+25, 1.0E-5 -- a ".0" on a bare mantissa and no zero padding. */
+static char* php_float_str(double d, int precision) {
+    if (d != d) return xstrdup("NAN");
+    if (d == HUGE_VAL) return xstrdup("INF");
+    if (d == -HUGE_VAL) return xstrdup("-INF");
+
+    /* 1. the significant digits and the decimal exponent, from %e:
+          echo uses `precision` digits, var_dump the fewest that read back
+          as the same double. */
+    char e[64];
+    if (precision < 0) {
+        int p;
+        for (p = 1; p <= 17; p++) {
+            snprintf(e, sizeof e, "%.*e", p - 1, d);
+            if (strtod(e, 0) == d) break;
+        }
+    } else {
+        snprintf(e, sizeof e, "%.*e", precision - 1, d);
+    }
+
+    int neg = (e[0] == '-');
+    const char* m = e + neg;
+    char digits[32];
+    int nd = 0;
+    for (const char* q = m; *q && *q != 'e' && nd < 30; q++)
+        if (*q >= '0' && *q <= '9') digits[nd++] = *q;
+    while (nd > 1 && digits[nd - 1] == '0') nd--;       /* trailing zeros */
+    digits[nd] = 0;
+    int x = atoi(strchr(m, 'e') + 1);
+
+    /* 2. where the point goes. PHP switches to E-notation when the exponent
+          is below -4 or at least the precision -- 14 for echo, 17 for
+          var_dump (measured against PHP 8.3: echo 1e14 is "1.0E+14" while
+          var_dump(1e16) is still "float(10000000000000000)"). */
+    int limit = precision < 0 ? 17 : precision;
+    char out[96];
+    char* o = out;
+    if (neg) *o++ = '-';
+
+    if (x < -4 || x >= limit) {
+        *o++ = digits[0];
+        *o++ = '.';
+        if (nd > 1) { memcpy(o, digits + 1, (size_t)nd - 1); o += nd - 1; }
+        else *o++ = '0';                                  /* 1.0E+25 */
+        o += sprintf(o, "E%c%d", x < 0 ? '-' : '+', x < 0 ? -x : x);
+    } else if (x >= 0) {
+        for (int i = 0; i <= x; i++) *o++ = i < nd ? digits[i] : '0';
+        if (nd > x + 1) {
+            *o++ = '.';
+            memcpy(o, digits + x + 1, (size_t)(nd - x - 1));
+            o += nd - x - 1;
+        }
+    } else {
+        *o++ = '0';
+        *o++ = '.';
+        for (int i = 0; i < -x - 1; i++) *o++ = '0';
+        memcpy(o, digits, (size_t)nd);
+        o += nd;
+    }
+    *o = 0;
+    return xstrdup(out);
+}
+
 static char* val_to_string(Value* v) {
     if (!v) return xstrdup("");
 
@@ -1506,8 +1810,8 @@ static char* val_to_string(Value* v) {
             snprintf(buf, sizeof buf, "%lld", v->i);
             return xstrdup(buf);
         case T_FLOAT:
-            snprintf(buf, sizeof buf, "%g", v->d);
-            return xstrdup(buf);
+            (void)buf;
+            return php_float_str(v->d, 14);
         case T_BOOL:
             return xstrdup(v->b ? "1" : "");
         case T_STRING:
@@ -1807,6 +2111,15 @@ static Var* env_find_current(Env* e, const char* name) {
         if (!strcmp(v->name, name)) return v;
 
     return 0;
+}
+
+/* Remove a variable from ONE scope -- unset() inside a function removes the
+   local, as in PHP. */
+static void env_unset(Env* e, const char* name) {
+    if (!e) return;
+    for (Var** pp = &e->vars; *pp; pp = &(*pp)->next) {
+        if (!strcmp((*pp)->name, name)) { *pp = (*pp)->next; return; }
+    }
 }
 
 static Value* env_get(Env* e, const char* name) {
@@ -2637,6 +2950,40 @@ static void apply_execution_limit(void) {
     setrlimit(RLIMIT_CPU, &rl);
 }
 
+/* VmData from /proc: what the process already holds before the script runs.
+   The limit is added ON TOP of it, so it means "the script may use this
+   much", as PHP's does -- and so a sanitizer build, whose baseline is huge,
+   is not refused at the first allocation. 0 if it cannot be read. */
+static size_t current_data_bytes(void) {
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    char line[256];
+    size_t kb = 0;
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, "VmData:", 7)) { kb = (size_t)strtoull(line + 7, 0, 10); break; }
+    fclose(f);
+    return kb * 1024;
+}
+
+static void apply_memory_limit(void) {
+    const char* e = getenv("PHPMINI_MEMORY_LIMIT");
+    long long lim = 256LL << 20;
+    if (e && *e) {
+        char* end = 0;
+        lim = strtoll(e, &end, 10);
+        if (end && (*end == 'k' || *end == 'K')) lim <<= 10;
+        else if (end && (*end == 'm' || *end == 'M')) lim <<= 20;
+        else if (end && (*end == 'g' || *end == 'G')) lim <<= 30;
+    }
+    if (lim <= 0) return;                               /* unlimited */
+
+    struct rlimit rl;
+    size_t base = current_data_bytes();
+    rl.rlim_cur = (rlim_t)(base + (size_t)lim);
+    rl.rlim_max = rl.rlim_cur + ((rlim_t)16 << 20);     /* headroom for the error path */
+    if (setrlimit(RLIMIT_DATA, &rl) == 0) mem_limit_bytes = (size_t)lim;
+}
+
 static void web_bootstrap(Env* env) {
     V_GET = v_new(T_ARRAY);
     V_POST = v_new(T_ARRAY);
@@ -2653,7 +3000,7 @@ static void web_bootstrap(Env* env) {
     env_set(env, "_REQUEST", V_REQUEST);
 
     fill_server_globals();
-    if (cgi_mode) apply_execution_limit();
+    if (cgi_mode) { apply_execution_limit(); apply_memory_limit(); }
 
     parse_urlencoded_into(getenv("QUERY_STRING"), V_GET);
     parse_cookies_into(getenv("HTTP_COOKIE"), V_COOKIE);
@@ -2668,55 +3015,104 @@ static void web_bootstrap(Env* env) {
     atexit(web_atexit);
 }
 
+/* var_dump in PHP's exact layout: two spaces per level, string keys quoted,
+   "=>" with no spaces, floats in their shortest exact form. It used to print
+   `[k] =>` and `float(%g)`, which reads like PHP but is not it -- so output
+   pasted from real PHP never matched. */
 static void dump_value(Value* v, int d) {
-    if (!v) {
-        emit_indent(d);
-        emit_string("NULL\n");
-        return;
-    }
-
     emit_indent(d);
 
+    if (!v) { emit_string("NULL\n"); return; }
+
     switch (v->type) {
-        case T_NULL:
-            emit_string("NULL\n");
+        case T_NULL:   emit_string("NULL\n"); break;
+        case T_INT:    emitf("int(%lld)\n", v->i); break;
+        case T_BOOL:   emitf("bool(%s)\n", v->b ? "true" : "false"); break;
+        case T_FLOAT: {
+            char* fs = php_float_str(v->d, -1);
+            emitf("float(%s)\n", fs);
+            free(fs);
             break;
-
-        case T_INT:
-            emitf("int(%lld)\n", v->i);
-            break;
-
-        case T_FLOAT:
-            emitf("float(%g)\n", v->d);
-            break;
-
-        case T_BOOL:
-            emitf("bool(%s)\n", v->b ? "true" : "false");
-            break;
-
+        }
         case T_STRING:
             emitf("string(%zu) \"%s\"\n", strlen(v->s ? v->s : ""), v->s ? v->s : "");
             break;
-
         case T_ARRAY:
             emitf("array(%d) {\n", array_count(v));
-
             for (ArrayItem* it = v->items; it; it = it->next) {
-                char* ks = val_to_string(it->key);
                 emit_indent(d + 1);
-                emitf("[%s] =>\n", ks);
-                free(ks);
+                if (it->key && it->key->type == T_INT) emitf("[%lld]=>\n", it->key->i);
+                else {
+                    char* ks = val_to_string(it->key);
+                    emitf("[\"%s\"]=>\n", ks);
+                    free(ks);
+                }
                 dump_value(it->val, d + 1);
             }
-
             emit_indent(d);
             emit_string("}\n");
             break;
-
         default:
-            emit_string("unknown\n");
+            emit_string("NULL\n");
             break;
     }
+}
+
+/* print_r's own layout -- it printed var_dump's before, so every print_r()
+   in a script produced the wrong format. Rendered into a buffer so that
+   print_r($x, true) can return it as a string, as in PHP. */
+static void pr_pad(Buf* b, int n) { while (n-- > 0) buf_ch(b, ' '); }
+
+static void pr_render(Buf* b, Value* v, int level) {
+    if (v && v->type == T_ARRAY) {
+        buf_addz(b, "Array\n");
+        pr_pad(b, level * 8);
+        buf_addz(b, "(\n");
+        for (ArrayItem* it = v->items; it; it = it->next) {
+            char* ks = val_to_string(it->key);
+            pr_pad(b, level * 8 + 4);
+            buf_ch(b, '[');
+            buf_addz(b, ks);
+            buf_addz(b, "] => ");
+            free(ks);
+            pr_render(b, it->val, level + 1);
+            buf_ch(b, '\n');
+        }
+        pr_pad(b, level * 8);
+        buf_addz(b, ")\n");
+    } else {
+        char* sv = val_to_string(v);
+        buf_addz(b, sv);
+        free(sv);
+    }
+}
+
+/* Building a NEW array whose keys are known to be unique: keep the tail, so
+   each append is O(1). array_put() scans the whole list for a duplicate key
+   and then walks it again to the end, which makes a 100,000-element
+   explode() quadratic. Only for fresh arrays -- never for one a script can
+   also be writing to. */
+typedef struct { Value* arr; ArrayItem* tail; long long next; } ArrBuild;
+
+static void ab_init(ArrBuild* b) { b->arr = v_new(T_ARRAY); b->tail = 0; b->next = 0; }
+
+static void ab_put(ArrBuild* b, Value* key, Value* val) {
+    ArrayItem* it = calloc(1, sizeof(ArrayItem));
+    it->key = key;
+    it->val = val;
+    if (b->tail) b->tail->next = it; else b->arr->items = it;
+    b->tail = it;
+    if (key->type == T_INT && key->i >= b->next) b->next = key->i + 1;
+}
+
+static void ab_push(ArrBuild* b, Value* val) { ab_put(b, v_int(b->next), val); }
+
+static Value* v_str_n(const char* s, size_t n) {
+    Value* v = v_new(T_STRING);
+    v->s = malloc(n + 1);
+    memcpy(v->s, s, n);
+    v->s[n] = 0;
+    return v;
 }
 
 static Value* arr_get(Value* arr, const char* key) {
@@ -2741,6 +3137,53 @@ static int arr_get_bool(Value* arr, const char* key, int def) {
     return v ? val_truthy(v) : def;
 }
 
+/* str_replace for one subject string. search/replace follow PHP: a string
+   search uses the string replacement; an array of searches is applied in
+   order, each with the matching replacement (or "" when the replacement array
+   runs out, or the one string when replace is a string). An empty search
+   string replaces nothing. */
+static char* replace_one(const char* in, const char* from, const char* to) {
+    size_t fl = strlen(from);
+    if (!fl) return xstrdup(in);
+    Buf b;
+    buf_init(&b);
+    const char* p = in;
+    for (;;) {
+        const char* hit = strstr(p, from);
+        if (!hit) { buf_addz(&b, p); break; }
+        buf_add(&b, p, (size_t)(hit - p));
+        buf_addz(&b, to);
+        p = hit + fl;
+    }
+    return b.data ? b.data : xstrdup("");
+}
+
+static char* str_replace_all(const char* in, Value* search, Value* repl) {
+    if (search->type != T_ARRAY) {
+        char* from = val_to_string(search);
+        char* to = repl->type == T_ARRAY ? xstrdup("Array") : val_to_string(repl);
+        char* out = replace_one(in, from, to);
+        free(from);
+        free(to);
+        return out;
+    }
+
+    char* cur = xstrdup(in);
+    ArrayItem* r = repl->type == T_ARRAY ? repl->items : 0;
+    for (ArrayItem* it = search->items; it; it = it->next) {
+        char* from = val_to_string(it->val);
+        char* to;
+        if (repl->type == T_ARRAY) { to = r ? val_to_string(r->val) : xstrdup(""); if (r) r = r->next; }
+        else to = val_to_string(repl);
+        char* next = replace_one(cur, from, to);
+        free(cur);
+        free(from);
+        free(to);
+        cur = next;
+    }
+    return cur;
+}
+
 static Value* builtin(const char* name, Value** args, int argc) {
 #define NEED(n) do { if (argc < (n)) fatal("%s expects at least %d argument(s)", name, n); } while (0)
 
@@ -2756,6 +3199,273 @@ static Value* builtin(const char* name, Value** args, int argc) {
         NEED(1);
         if (args[0]->type == T_ARRAY) return v_int(array_count(args[0]));
         return v_int(args[0]->type == T_NULL ? 0 : 1);
+    }
+
+    /* ---------- strings (milestone 2) ----------
+       Each follows PHP 8's rules, including its errors: where PHP 8 throws a
+       ValueError the call is a fatal error here, since this runtime has no
+       exceptions to throw. */
+
+    if (!strcmp(name, "substr")) {
+        NEED(2);
+        char* str = val_to_string(args[0]);
+        long long len = (long long)strlen(str);
+        long long start = val_to_int(args[1]);
+        long long cnt = (argc > 2 && args[2]->type != T_NULL) ? val_to_int(args[2]) : len;
+
+        if (start < 0) { start += len; if (start < 0) start = 0; }
+        if (start > len) start = len;               /* PHP 8: "" past the end */
+        long long avail = len - start;
+        if (cnt < 0) { cnt += avail; if (cnt < 0) cnt = 0; }
+        if (cnt > avail) cnt = avail;
+
+        Value* r = v_str_n(str + start, (size_t)cnt);
+        free(str);
+        return r;
+    }
+
+    if (!strcmp(name, "strpos")) {
+        NEED(2);
+        char* hay = val_to_string(args[0]);
+        char* ndl = val_to_string(args[1]);
+        long long hl = (long long)strlen(hay);
+        long long off = argc > 2 ? val_to_int(args[2]) : 0;
+
+        if (off < 0) off += hl;
+        if (off < 0 || off > hl)
+            fatal("strpos(): Argument #3 ($offset) must be contained in argument #1 ($haystack)");
+
+        char* hit = strstr(hay + off, ndl);         /* "" matches at off, as PHP 8 */
+        Value* r = hit ? v_int((long long)(hit - hay)) : v_bool(0);
+        free(hay);
+        free(ndl);
+        return r;
+    }
+
+    if (!strcmp(name, "str_repeat")) {
+        NEED(2);
+        char* str = val_to_string(args[0]);
+        long long times = val_to_int(args[1]);
+        if (times < 0)
+            fatal("str_repeat(): Argument #2 ($times) must be greater than or equal to 0");
+
+        size_t sl = strlen(str);
+        /* sl * times can overflow size_t; refuse rather than allocate a wrap-
+           around size and write past it. (Real sizes stop at memory_limit.) */
+        if (sl && (unsigned long long)times > (SIZE_MAX - 1) / sl)
+            fatal("str_repeat(): result is too big");
+
+        size_t total = sl * (size_t)times;
+        Value* r = v_new(T_STRING);
+        r->s = malloc(total + 1);
+        for (long long i = 0; i < times; i++) memcpy(r->s + (size_t)i * sl, str, sl);
+        r->s[total] = 0;
+        free(str);
+        return r;
+    }
+
+    if (!strcmp(name, "trim") || !strcmp(name, "ltrim") || !strcmp(name, "rtrim")) {
+        NEED(1);
+        char* str = val_to_string(args[0]);
+        unsigned char strip[256] = {0};
+
+        if (argc > 1) {
+            /* the character list, including PHP's "a..z" ranges */
+            char* cl = val_to_string(args[1]);
+            size_t n = strlen(cl);
+            for (size_t i = 0; i < n; i++) {
+                unsigned char c0 = (unsigned char)cl[i];
+                if (i + 3 < n && cl[i + 1] == '.' && cl[i + 2] == '.' &&
+                    (unsigned char)cl[i + 3] >= c0) {
+                    for (unsigned c = c0; c <= (unsigned char)cl[i + 3]; c++) strip[c] = 1;
+                    i += 3;
+                } else {
+                    strip[c0] = 1;
+                }
+            }
+            free(cl);
+        } else {
+            const char* def = " \t\n\r\v";            /* plus NUL, as PHP */
+            for (const char* p = def; *p; p++) strip[(unsigned char)*p] = 1;
+            strip[0] = 1;
+        }
+
+        size_t a = 0, z = strlen(str);
+        if (strcmp(name, "rtrim")) while (a < z && strip[(unsigned char)str[a]]) a++;
+        if (strcmp(name, "ltrim")) while (z > a && strip[(unsigned char)str[z - 1]]) z--;
+
+        Value* r = v_str_n(str + a, z - a);
+        free(str);
+        return r;
+    }
+
+    if (!strcmp(name, "explode")) {
+        NEED(2);
+        char* sep = val_to_string(args[0]);
+        char* str = val_to_string(args[1]);
+        long long limit = argc > 2 ? val_to_int(args[2]) : LLONG_MAX;
+        size_t sepl = strlen(sep);
+
+        if (!sepl) fatal("explode(): Argument #1 ($separator) cannot be empty");
+        if (limit == 0) limit = 1;
+
+        /* split everything first; the limit rules are easier on the list */
+        size_t np = 0, cap = 8;
+        const char** starts = malloc(cap * sizeof *starts);
+        size_t* lens = malloc(cap * sizeof *lens);
+        const char* p = str;
+        for (;;) {
+            const char* hit = strstr(p, sep);
+            if (np == cap) {
+                cap *= 2;
+                starts = realloc(starts, cap * sizeof *starts);
+                lens = realloc(lens, cap * sizeof *lens);
+            }
+            starts[np] = p;
+            lens[np] = hit ? (size_t)(hit - p) : strlen(p);
+            np++;
+            if (!hit) break;
+            p = hit + sepl;
+        }
+
+        ArrBuild ab;
+        ab_init(&ab);
+        if (limit > 0) {
+            size_t keep = (size_t)limit < np ? (size_t)limit : np;
+            for (size_t i = 0; i < keep; i++) {
+                /* the last kept piece runs to the end of the string */
+                size_t l = (i + 1 == keep && keep < np) ? strlen(starts[i]) : lens[i];
+                ab_push(&ab, v_str_n(starts[i], l));
+            }
+        } else {
+            long long keep = (long long)np + limit;   /* drop the last -limit */
+            for (long long i = 0; i < keep; i++) ab_push(&ab, v_str_n(starts[i], lens[i]));
+        }
+
+        free(starts);
+        free(lens);
+        free(sep);
+        free(str);
+        return ab.arr;
+    }
+
+    if (!strcmp(name, "implode") || !strcmp(name, "join")) {
+        NEED(1);
+        Value* arr;
+        char* glue;
+        if (argc == 1) {
+            if (args[0]->type != T_ARRAY)
+                fatal("implode(): Argument #1 ($array) must be of type array");
+            arr = args[0];
+            glue = xstrdup("");
+        } else {
+            if (args[1]->type != T_ARRAY)
+                fatal("implode(): Argument #2 ($array) must be of type ?array");
+            arr = args[1];
+            glue = val_to_string(args[0]);
+        }
+
+        Buf b;
+        buf_init(&b);
+        for (ArrayItem* it = arr->items; it; it = it->next) {
+            if (it != arr->items) buf_addz(&b, glue);
+            char* part = val_to_string(it->val);
+            buf_addz(&b, part);
+            free(part);
+        }
+        free(glue);
+        Value* r = v_new(T_STRING);
+        r->s = b.data ? b.data : xstrdup("");
+        return r;
+    }
+
+    if (!strcmp(name, "str_replace")) {
+        NEED(3);
+        /* search and replace may each be a string or an array, and the
+           subject may be an array -- every combination PHP accepts. */
+        Value* search = args[0];
+        Value* repl = args[1];
+        Value* subj = args[2];
+
+        if (subj->type == T_ARRAY) {
+            ArrBuild ab;
+            ab_init(&ab);
+            for (ArrayItem* it = subj->items; it; it = it->next) {
+                char* in = val_to_string(it->val);
+                char* out = str_replace_all(in, search, repl);
+                free(in);
+                Value* v = v_new(T_STRING);
+                v->s = out;
+                ab_put(&ab, val_clone(it->key), v);
+            }
+            return ab.arr;
+        }
+
+        char* in = val_to_string(subj);
+        Value* r = v_new(T_STRING);
+        r->s = str_replace_all(in, search, repl);
+        free(in);
+        return r;
+    }
+
+    /* ---------- arrays (milestone 2) ---------- */
+
+    if (!strcmp(name, "in_array")) {
+        NEED(2);
+        if (args[1]->type != T_ARRAY)
+            fatal("in_array(): Argument #2 ($haystack) must be of type array");
+        int strict = argc > 2 && val_truthy(args[2]);
+        for (ArrayItem* it = args[1]->items; it; it = it->next)
+            if (strict ? val_same(it->val, args[0]) : val_equals(it->val, args[0]))
+                return v_bool(1);
+        return v_bool(0);
+    }
+
+    if (!strcmp(name, "array_keys")) {
+        NEED(1);
+        if (args[0]->type != T_ARRAY)
+            fatal("array_keys(): Argument #1 ($array) must be of type array");
+        int strict = argc > 2 && val_truthy(args[2]);
+        ArrBuild ab;
+        ab_init(&ab);
+        for (ArrayItem* it = args[0]->items; it; it = it->next) {
+            /* array_keys($a, $value): only the keys holding that value */
+            if (argc > 1 && !(strict ? val_same(it->val, args[1]) : val_equals(it->val, args[1])))
+                continue;
+            ab_push(&ab, val_clone(it->key));
+        }
+        return ab.arr;
+    }
+
+    if (!strcmp(name, "array_values")) {
+        NEED(1);
+        if (args[0]->type != T_ARRAY)
+            fatal("array_values(): Argument #1 ($array) must be of type array");
+        ArrBuild ab;
+        ab_init(&ab);
+        for (ArrayItem* it = args[0]->items; it; it = it->next) ab_push(&ab, val_clone(it->val));
+        return ab.arr;
+    }
+
+    if (!strcmp(name, "array_push")) {
+        NEED(1);
+        /* The first argument is the caller's own array, not a copy (builtins
+           receive the stored value), so this appends in place -- PHP's
+           by-reference parameter. A variable that does not hold an array is
+           PHP 8's TypeError. */
+        if (args[0]->type != T_ARRAY)
+            fatal("array_push(): Argument #1 ($array) must be of type array");
+        for (int i = 1; i < argc; i++)
+            array_put(args[0], v_int(array_next_index(args[0])), val_clone(args[i]));
+        return v_int(array_count(args[0]));
+    }
+
+    if (!strcmp(name, "array_key_exists") || !strcmp(name, "key_exists")) {
+        NEED(2);
+        if (args[1]->type != T_ARRAY)
+            fatal("array_key_exists(): Argument #2 ($array) must be of type array");
+        /* unlike isset(), a key holding null still exists */
+        return v_bool(array_find(args[1], normalize_key(args[0])) != 0);
     }
 
     if (!strcmp(name, "strtoupper")) {
@@ -2857,8 +3567,17 @@ static Value* builtin(const char* name, Value** args, int argc) {
 
     if (!strcmp(name, "print_r")) {
         NEED(1);
-        dump_value(args[0], 0);
-        return v_int(1);
+        Buf b;
+        buf_init(&b);
+        pr_render(&b, args[0], 0);
+        if (argc > 1 && val_truthy(args[1])) {
+            Value* r = v_new(T_STRING);
+            r->s = b.data ? b.data : xstrdup("");
+            return r;
+        }
+        if (b.data) emit_string(b.data);
+        free(b.data);
+        return v_bool(1);
     }
 
     if (!strcmp(name, "exit") || !strcmp(name, "die")) {
@@ -3168,7 +3887,33 @@ static Value* eval(Node* n, Env* env) {
         }
 
         case NT_INDEX:
+            if (!n->b) fatal("Cannot use [] for reading");
             return eval_index(eval(n->a, env), eval(n->b, env));
+
+        case NT_INCDEC: {
+            /* null++ is 1 and null-- stays null, as in PHP. Everything else
+               goes through arith(), so PHP_INT_MAX++ becomes a float rather
+               than overflowing. (PHP's "a"++ == "b" string increment is not
+               implemented; a non-numeric string counts as 0.) */
+            Value* old = val_clone(eval(n->a, env));
+            Value* nv;
+            if (old->type == T_NULL) nv = n->op > 0 ? v_int(1) : v_null();
+            else nv = arith(n->op > 0 ? OP_ADD : OP_SUB, old, v_int(1));
+            assign_to(n->a, nv, env);
+            return n->i ? nv : old;
+        }
+
+        case NT_TERNARY: {
+            Value* c = eval(n->a, env);
+            if (val_truthy(c)) return n->b ? eval(n->b, env) : c;
+            return eval(n->c, env);
+        }
+
+        case NT_COALESCE: {
+            Value* l = eval(n->a, env);
+            if (l && l->type != T_NULL) return l;
+            return eval(n->b, env);
+        }
 
         case NT_ARRAY: {
             Value* arr = v_new(T_ARRAY);
@@ -3196,8 +3941,80 @@ static Value* eval(Node* n, Env* env) {
     }
 }
 
+/* Called by a loop after each pass of its body. Returns 1 if the loop must
+   stop. break N: this loop stops and N-1 more outer loops will too.
+   continue N: N == 1 continues THIS loop; N > 1 stops it so the loop N
+   levels out continues. */
+static int loop_control_done(void) {
+    if (brk_n) { brk_n--; return 1; }
+    if (cont_n) { cont_n--; return cont_n > 0; }
+    return 0;
+}
+
+/* The one place a value is stored into a variable or an array element.
+   Was inline in NT_ASSIGN; pulled out so ++, --, op= and $a[] all write
+   through exactly the same code as plain assignment. */
+static long long array_next_index(Value* arr) {
+    long long next = 0;
+    if (!arr || arr->type != T_ARRAY) return 0;
+    for (ArrayItem* it = arr->items; it; it = it->next)
+        if (it->key && it->key->type == T_INT && it->key->i >= next)
+            next = it->key->i + 1;
+    return next;
+}
+
+/* AUDIT: superglobals are the same array in every scope. Writes used to go
+   to the CURRENT scope only, so $_SESSION["user"] = ... inside a function
+   created a local array and was thrown away when the function returned --
+   which is where login code lives, so sessions were effectively broken for
+   real applications even after the file format was fixed. */
+static int is_superglobal(const char* name) {
+    static const char* sg[] = { "_GET", "_POST", "_COOKIE", "_SESSION", "_SERVER", "_REQUEST", 0 };
+    for (int i = 0; sg[i]; i++) if (!strcmp(name, sg[i])) return 1;
+    return 0;
+}
+
+static Env* scope_for(Env* env, const char* name) {
+    return (global_env && is_superglobal(name)) ? global_env : env;
+}
+
+static void assign_to(Node* target, Value* val, Env* env) {
+    if (target->type == NT_VAR) {
+        env_set(scope_for(env, target->s), target->s, val_clone(val));
+    } else if (target->type == NT_INDEX) {
+        Node* base = target->a;
+        Value* cont;
+
+        if (base->type == NT_VAR) {
+            env = scope_for(env, base->s);
+            Var* cv = env_find_current(env, base->s);
+            if (cv) {
+                cont = cv->val;
+            } else {
+                cont = v_new(T_ARRAY);
+                env_set(env, base->s, cont);
+            }
+        } else {
+            cont = eval(base, env);
+        }
+
+        /* $a[] = v: append at one past the highest integer key, as PHP does. */
+        Value* key;
+        if (!target->b) {
+            if (cont && cont->type == T_NULL) { cont->type = T_ARRAY; cont->items = 0; }
+            if (!cont || cont->type != T_ARRAY) fatal("[] operator not supported for this value");
+            key = v_int(array_next_index(cont));
+        } else {
+            key = eval(target->b, env);
+        }
+        set_index(cont, key, val_clone(val));
+    } else {
+        fatal("Invalid assignment target");
+    }
+}
+
 static void exec_list(NodeList* l, Env* env) {
-    for (; l && !in_ret; l = l->next)
+    for (; l && !in_ret && !brk_n && !cont_n; l = l->next)
         exec(l->node, env);
 }
 
@@ -3256,31 +4073,87 @@ static void exec(Node* n, Env* env) {
             break;
 
         case NT_ASSIGN:
-            if (n->a->type == NT_VAR) {
-                Value* v = eval(n->b, env);
-                env_set(env, n->a->s, val_clone(v));
-            } else if (n->a->type == NT_INDEX) {
-                Node* base = n->a->a;
-                Value* cont;
-
-                if (base->type == NT_VAR) {
-                    Var* cv = env_find_current(env, base->s);
-                    if (cv) {
-                        cont = cv->val;
-                    } else {
-                        cont = v_new(T_ARRAY);
-                        env_set(env, base->s, cont);
-                    }
-                } else {
-                    cont = eval(base, env);
-                }
-
-                Value* key = eval(n->a->b, env);
-                Value* val = eval(n->b, env);
-                set_index(cont, key, val_clone(val));
+            if (!n->i) {
+                assign_to(n->a, eval(n->b, env), env);
             } else {
-                fatal("Invalid assignment target");
+                /* Compound: read the target, combine, write it back. The
+                   index expression of $a[k] op= v is evaluated twice (once
+                   to read, once to write), so a key with side effects runs
+                   twice -- the price of keeping one write path. */
+                /* $a[] op= v appends (null op v), as PHP does. */
+                int append = n->a->type == NT_INDEX && !n->a->b;
+                Value* curv = append ? v_null() : eval(n->a, env);
+                if (n->op == OP_COALESCE) {
+                    if (!curv || curv->type == T_NULL)
+                        assign_to(n->a, eval(n->b, env), env);
+                } else {
+                    assign_to(n->a, arith(n->op, curv, eval(n->b, env)), env);
+                }
             }
+            break;
+
+        case NT_FOREACH: {
+            Value* src = eval(n->a, env);
+            if (!src || src->type != T_ARRAY) {
+                fprintf(stderr, "PHP warning: foreach() argument must be of type array\n");
+                break;
+            }
+
+            /* PHP iterates a by-value foreach over a COPY: changing the array
+               inside the loop does not change what the loop visits. Copying
+               the whole array would be O(n^2) here (every append walks the
+               list), so the loop takes the current key and value POINTERS up
+               front instead -- O(n). A write replaces an element's value
+               pointer rather than changing the old value, and nothing is
+               freed while a script runs, so the pointers taken here keep
+               showing exactly what the array held when the loop began. */
+            int cnt = array_count(src);
+            Value** ks = malloc(sizeof(Value*) * (size_t)(cnt ? cnt : 1));
+            Value** vs = malloc(sizeof(Value*) * (size_t)(cnt ? cnt : 1));
+            int k = 0;
+            for (ArrayItem* it = src->items; it && k < cnt; it = it->next, k++) {
+                ks[k] = it->key;
+                vs[k] = it->val;
+            }
+
+            for (int i = 0; i < k && !in_ret; i++) {
+                if (n->b) assign_to(n->b, ks[i], env);
+                assign_to(n->c, vs[i], env);
+                exec_list(n->l1, env);
+                if (loop_control_done()) break;
+            }
+            free(ks);
+            free(vs);
+            break;
+        }
+
+        case NT_UNSET:
+            for (NodeList* l = n->l1; l; l = l->next) {
+                Node* t = l->node;
+                if (t->type == NT_VAR) {
+                    env_unset(scope_for(env, t->s), t->s);
+                } else {
+                    /* the element's container, found without creating it:
+                       unsetting a key of a missing array is a no-op */
+                    Value* cont = 0;
+                    if (t->a->type == NT_VAR) {
+                        Var* cv = env_find_current(scope_for(env, t->a->s), t->a->s);
+                        cont = cv ? cv->val : 0;
+                    } else {
+                        cont = eval(t->a, env);
+                    }
+                    if (cont && cont->type == T_ARRAY)
+                        array_remove(cont, normalize_key(eval(t->b, env)));
+                }
+            }
+            break;
+
+        case NT_BREAK:
+            brk_n = n->i;
+            break;
+
+        case NT_CONTINUE:
+            cont_n = n->i;
             break;
 
         case NT_IF: {
@@ -3295,6 +4168,7 @@ static void exec(Node* n, Env* env) {
                 Value* c = eval(n->a, env);
                 if (!val_truthy(c)) break;
                 exec_list(n->l1, env);
+                if (loop_control_done()) break;
             }
             break;
 
@@ -3308,7 +4182,7 @@ static void exec(Node* n, Env* env) {
                 }
 
                 exec_list(n->l1, env);
-                if (in_ret) break;
+                if (in_ret || loop_control_done()) break;
 
                 if (n->c) exec(n->c, env);
             }
