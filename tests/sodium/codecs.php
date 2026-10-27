@@ -1,0 +1,2 @@
+<?php
+echo sodium_bin2hex("\0\xffab"), " ", bin2hex(sodium_hex2bin("00ff6162")), " ", bin2hex(sodium_hex2bin("00:ff:61", ":")), " ", sodium_bin2base64("\0\xfe\xff?", SODIUM_BASE64_VARIANT_ORIGINAL), " ", sodium_bin2base64("\0\xfe\xff?", SODIUM_BASE64_VARIANT_URLSAFE_NO_PADDING), " ", bin2hex(sodium_base642bin("AP7/Pw==", SODIUM_BASE64_VARIANT_ORIGINAL)), " ", bin2hex(sodium_base642bin("AP7_Pw", SODIUM_BASE64_VARIANT_URLSAFE_NO_PADDING)), " ", bin2hex(sodium_base642bin("AP 7/ Pw==", 1, " ")), " ", sodium_bin2base64("", 1), "|";

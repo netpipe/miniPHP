@@ -1,0 +1,2 @@
+<?php
+$st = sodium_crypto_generichash_init(); sodium_crypto_generichash_update($st, "ab"); sodium_crypto_generichash_update($st, "c\0"); echo strlen($st), " ", bin2hex(sodium_crypto_generichash_final($st)), " "; var_dump($st); $st = sodium_crypto_generichash_init(str_repeat("k", 32), 64); sodium_crypto_generichash_update($st, "x"); echo bin2hex(sodium_crypto_generichash_final($st, 64)) === bin2hex(sodium_crypto_generichash("x", str_repeat("k", 32), 64)) ? "match" : "differ";

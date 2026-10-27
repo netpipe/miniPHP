@@ -5,6 +5,8 @@ echo, variables, scalars, arrays ([] and array()), arithmetic, concatenation, co
 <br>
 still lacks many things: classes, exceptions, robust locking, full standard library, etc. But it is a reasonably complete little CGI/session-capable PHP-like runtime in one C file.
 <br><br>
+make SODIUM=1 - uses the bundled libsodium 1.0.22, nothing to install, about 10 seconds extra the first time
+make SODIUM=system
 
 ### CGI features
 * ?a=test query parsing<br>

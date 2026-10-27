@@ -1,0 +1,111 @@
+Uncaught SodiumException: sodium_crypto_secretbox(): Argument #2 ($nonce) must be SODIUM_CRYPTO_SECRETBOX_NONCEBYTES bytes long
+Uncaught SodiumException: sodium_crypto_secretbox(): Argument #3 ($key) must be SODIUM_CRYPTO_SECRETBOX_KEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_secretbox_open(): Argument #3 ($key) must be SODIUM_CRYPTO_SECRETBOX_KEYBYTES bytes long
+Uncaught ArgumentCountError: sodium_crypto_secretbox() expects exactly 3 arguments, 2 given
+Uncaught TypeError: sodium_crypto_secretbox(): Argument #1 ($message) must be of type string, array given
+Uncaught ArgumentCountError: sodium_crypto_secretbox_keygen() expects exactly 0 arguments, 1 given
+Uncaught SodiumException: sodium_crypto_box(): Argument #3 ($key_pair) must be SODIUM_CRYPTO_BOX_KEYPAIRBYTES bytes long
+Uncaught SodiumException: sodium_crypto_box(): Argument #2 ($nonce) must be SODIUM_CRYPTO_BOX_NONCEBYTES bytes long
+Uncaught SodiumException: sodium_crypto_box_open(): Argument #3 ($key_pair) must be SODIUM_CRYPTO_BOX_KEYPAIRBYTES bytes long
+Uncaught SodiumException: sodium_crypto_box_seal(): Argument #2 ($public_key) must be SODIUM_CRYPTO_BOX_PUBLICKEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_box_seal_open(): Argument #2 ($key_pair) must be SODIUM_CRYPTO_BOX_KEYPAIRBYTES bytes long
+Uncaught SodiumException: sodium_crypto_box_seed_keypair(): Argument #1 ($seed) must be SODIUM_CRYPTO_BOX_SEEDBYTES bytes long
+Uncaught SodiumException: sodium_crypto_box_secretkey(): Argument #1 ($key_pair) must be SODIUM_CRYPTO_BOX_KEYPAIRBYTES bytes long
+Uncaught SodiumException: sodium_crypto_box_publickey(): Argument #1 ($key_pair) must be SODIUM_CRYPTO_BOX_KEYPAIRBYTES bytes long
+Uncaught SodiumException: sodium_crypto_box_publickey_from_secretkey(): Argument #1 ($secret_key) must be SODIUM_CRYPTO_BOX_SECRETKEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_box_keypair_from_secretkey_and_publickey(): Argument #1 ($secret_key) must be SODIUM_CRYPTO_BOX_SECRETKEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_box_keypair_from_secretkey_and_publickey(): Argument #2 ($public_key) must be SODIUM_CRYPTO_BOX_PUBLICKEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_scalarmult(): Argument #1 ($n) must be SODIUM_CRYPTO_SCALARMULT_SCALARBYTES bytes long
+Uncaught SodiumException: sodium_crypto_scalarmult(): Argument #2 ($p) must be SODIUM_CRYPTO_SCALARMULT_SCALARBYTES bytes long
+Uncaught SodiumException: sodium_crypto_scalarmult_base(): Argument #1 ($secret_key) must be SODIUM_CRYPTO_BOX_SECRETKEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_kx_seed_keypair(): Argument #1 ($seed) must be SODIUM_CRYPTO_KX_SEEDBYTES bytes long
+Uncaught SodiumException: sodium_crypto_kx_secretkey(): Argument #1 ($key_pair) must be SODIUM_CRYPTO_KX_KEYPAIRBYTES bytes long
+Uncaught SodiumException: sodium_crypto_kx_publickey(): Argument #1 ($key_pair) must be SODIUM_CRYPTO_KX_KEYPAIRBYTES bytes long
+Uncaught SodiumException: sodium_crypto_kx_client_session_keys(): Argument #1 ($client_key_pair) must be SODIUM_CRYPTO_KX_KEYPAIRBYTES bytes long
+Uncaught SodiumException: sodium_crypto_kx_client_session_keys(): Argument #2 ($server_key) must be SODIUM_CRYPTO_KX_PUBLICKEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_kx_server_session_keys(): Argument #2 ($client_key) must be SODIUM_CRYPTO_KX_PUBLICKEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_sign(): Argument #2 ($secret_key) must be SODIUM_CRYPTO_SIGN_SECRETKEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_sign_detached(): Argument #2 ($secret_key) must be SODIUM_CRYPTO_SIGN_SECRETKEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_sign_open(): Argument #2 ($public_key) must be SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_sign_verify_detached(): Argument #1 ($signature) must be SODIUM_CRYPTO_SIGN_BYTES bytes long
+Uncaught SodiumException: sodium_crypto_sign_verify_detached(): Argument #3 ($public_key) must be SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_sign_seed_keypair(): Argument #1 ($seed) must be SODIUM_CRYPTO_SIGN_SEEDBYTES bytes long
+Uncaught SodiumException: sodium_crypto_sign_secretkey(): Argument #1 ($key_pair) must be SODIUM_CRYPTO_SIGN_KEYPAIRBYTES bytes long
+Uncaught SodiumException: sodium_crypto_sign_publickey(): Argument #1 ($key_pair) must be SODIUM_CRYPTO_SIGN_KEYPAIRBYTES bytes long
+Uncaught SodiumException: sodium_crypto_sign_publickey_from_secretkey(): Argument #1 ($secret_key) must be SODIUM_CRYPTO_SIGN_SECRETKEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_sign_keypair_from_secretkey_and_publickey(): Argument #1 ($secret_key) must be SODIUM_CRYPTO_SIGN_SECRETKEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_sign_ed25519_sk_to_curve25519(): Argument #1 ($secret_key) must be SODIUM_CRYPTO_SIGN_SECRETKEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_sign_ed25519_pk_to_curve25519(): Argument #1 ($public_key) must be SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES bytes long
+Uncaught SodiumException: conversion failed
+Uncaught SodiumException: unsupported output length
+Uncaught SodiumException: unsupported output length
+Uncaught SodiumException: unsupported key length
+Uncaught ArgumentCountError: sodium_crypto_generichash() expects at most 3 arguments, 4 given
+Uncaught SodiumException: unsupported key length
+Uncaught SodiumException: unsupported output length
+Uncaught SodiumException: incorrect state length
+Uncaught SodiumException: sodium_crypto_generichash_update(): Argument #1 ($state) must be a reference to a state
+Uncaught SodiumException: unsupported output length
+Uncaught SodiumException: sodium_crypto_auth(): Argument #2 ($key) must be SODIUM_CRYPTO_AUTH_KEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_auth_verify(): Argument #1 ($mac) must be SODIUM_CRYPTO_AUTH_BYTES bytes long
+Uncaught SodiumException: sodium_crypto_auth_verify(): Argument #3 ($key) must be SODIUM_CRYPTO_AUTH_KEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_shorthash(): Argument #2 ($key) must be SODIUM_CRYPTO_SHORTHASH_KEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_kdf_derive_from_key(): Argument #1 ($subkey_length) must be greater than or equal to SODIUM_CRYPTO_KDF_BYTES_MIN
+Uncaught SodiumException: sodium_crypto_kdf_derive_from_key(): Argument #1 ($subkey_length) must be less than or equal to SODIUM_CRYPTO_KDF_BYTES_MAX
+Uncaught SodiumException: sodium_crypto_kdf_derive_from_key(): Argument #2 ($subkey_id) must be greater than or equal to 0
+Uncaught SodiumException: sodium_crypto_kdf_derive_from_key(): Argument #3 ($context) must be SODIUM_CRYPTO_KDF_CONTEXTBYTES bytes long
+Uncaught SodiumException: sodium_crypto_kdf_derive_from_key(): Argument #4 ($key) must be SODIUM_CRYPTO_KDF_BYTES_MIN bytes long
+Uncaught TypeError: sodium_crypto_kdf_derive_from_key(): Argument #1 ($subkey_length) must be of type int, string given
+Uncaught SodiumException: sodium_crypto_pwhash(): Argument #1 ($length) must be greater than 0
+Uncaught SodiumException: sodium_crypto_pwhash(): Argument #3 ($salt) must be SODIUM_CRYPTO_PWHASH_SALTBYTES bytes long
+Uncaught SodiumException: sodium_crypto_pwhash(): Argument #4 ($opslimit) must be greater than 0
+Uncaught SodiumException: sodium_crypto_pwhash(): Argument #5 ($memlimit) must be greater than 0
+Uncaught SodiumException: unsupported password hashing algorithm
+Uncaught SodiumException: sodium_crypto_pwhash(): Argument #5 ($memlimit) must be greater than or equal to 8192
+Uncaught SodiumException: sodium_crypto_pwhash_str(): Argument #2 ($opslimit) must be greater than 0
+Uncaught SodiumException: sodium_crypto_pwhash_str(): Argument #3 ($memlimit) must be greater than 0
+Uncaught SodiumException: sodium_crypto_pwhash_str(): Argument #3 ($memlimit) must be greater than or equal to 8192
+Uncaught SodiumException: sodium_crypto_aead_xchacha20poly1305_ietf_encrypt(): Argument #3 ($nonce) must be SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NPUBBYTES bytes long
+Uncaught SodiumException: sodium_crypto_aead_xchacha20poly1305_ietf_encrypt(): Argument #4 ($key) must be SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_KEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_aead_xchacha20poly1305_ietf_decrypt(): Argument #4 ($key) must be SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_KEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_aead_chacha20poly1305_ietf_encrypt(): Argument #3 ($nonce) must be SODIUM_CRYPTO_AEAD_CHACHA20POLY1305_IETF_NPUBBYTES bytes long
+Uncaught SodiumException: sodium_crypto_aead_chacha20poly1305_encrypt(): Argument #3 ($nonce) must be SODIUM_CRYPTO_AEAD_CHACHA20POLY1305_NPUBBYTES bytes long
+Uncaught SodiumException: sodium_crypto_aead_chacha20poly1305_decrypt(): Argument #4 ($key) must be SODIUM_CRYPTO_AEAD_CHACHA20POLY1305_KEYBYTES bytes long
+Uncaught ArgumentCountError: sodium_crypto_aead_xchacha20poly1305_ietf_encrypt() expects exactly 4 arguments, 3 given
+Uncaught SodiumException: sodium_crypto_stream(): Argument #1 ($length) must be greater than 0
+Uncaught SodiumException: sodium_crypto_stream(): Argument #2 ($nonce) must be SODIUM_CRYPTO_STREAM_NONCEBYTES bytes long
+Uncaught SodiumException: sodium_crypto_stream(): Argument #3 ($key) must be SODIUM_CRYPTO_STREAM_KEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_stream_xor(): Argument #2 ($nonce) must be SODIUM_CRYPTO_STREAM_NONCEBYTES bytes long
+Uncaught SodiumException: sodium_crypto_stream_xchacha20(): Argument #1 ($length) must be greater than 0
+Uncaught SodiumException: sodium_crypto_stream_xchacha20_xor(): Argument #3 ($key) must be SODIUM_CRYPTO_STREAM_XCHACHA20_KEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_stream_xchacha20_xor_ic(): Argument #3 ($counter) must be SODIUM_CRYPTO_STREAM_XCHACHA20_KEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_stream_xchacha20_xor_ic(): Argument #2 ($nonce) must be SODIUM_CRYPTO_STREAM_XCHACHA20_NONCEBYTES bytes long
+Uncaught SodiumException: sodium_crypto_secretstream_xchacha20poly1305_init_push(): Argument #1 ($key) must be SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_KEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_secretstream_xchacha20poly1305_init_pull(): Argument #1 ($header) must be SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_HEADERBYTES bytes long
+Uncaught SodiumException: sodium_crypto_secretstream_xchacha20poly1305_init_pull(): Argument #2 ($key) must be SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_KEYBYTES bytes long
+Uncaught SodiumException: sodium_crypto_secretstream_xchacha20poly1305_push(): Argument #1 ($state) must have a correct length
+Uncaught SodiumException: incorrect state length
+Uncaught SodiumException: incorrect state length
+Uncaught SodiumException: sodium_crypto_secretstream_xchacha20poly1305_push(): Argument #1 ($state) must be a reference to a state
+Uncaught SodiumException: sodium_crypto_secretstream_xchacha20poly1305_push(): Argument #4 ($tag) must be in the range of 0-255
+Uncaught SodiumException: sodium_crypto_secretstream_xchacha20poly1305_push(): Argument #4 ($tag) must be in the range of 0-255
+Uncaught SodiumException: sodium_hex2bin(): Argument #1 ($string) must be a valid hexadecimal string
+Uncaught SodiumException: sodium_hex2bin(): Argument #1 ($string) must be a valid hexadecimal string
+Uncaught SodiumException: sodium_hex2bin(): Argument #1 ($string) must be a valid hexadecimal string
+Uncaught SodiumException: sodium_bin2base64(): Argument #2 ($id) must be a valid base64 variant identifier
+Uncaught SodiumException: sodium_bin2base64(): Argument #2 ($id) must be a valid base64 variant identifier
+Uncaught SodiumException: sodium_base642bin(): Argument #1 ($string) must be a valid base64 string
+Uncaught SodiumException: sodium_base642bin(): Argument #2 ($id) must be a valid base64 variant identifier
+Uncaught SodiumException: sodium_base642bin(): Argument #1 ($string) must be a valid base64 string
+Uncaught SodiumException: sodium_memcmp(): Argument #1 ($string1) and argument #2 ($string_2) must have the same length
+Uncaught SodiumException: sodium_compare(): Argument #1 ($string1) and argument #2 ($string_2) must have the same length
+Uncaught SodiumException: a PHP string is required
+Uncaught SodiumException: a PHP string is required
+Uncaught SodiumException: PHP strings are required
+Uncaught SodiumException: sodium_add(): Argument #1 ($string1) and argument #2 ($string_2) must have the same length
+Uncaught SodiumException: sodium_pad(): Argument #2 ($block_size) must be greater than 0
+Uncaught SodiumException: sodium_unpad(): Argument #2 ($block_size) must be greater than 0
+Uncaught SodiumException: sodium_unpad(): Argument #1 ($string) must be at least as long as the block size
+Uncaught SodiumException: invalid padding
+Uncaught ValueError: random_bytes(): Argument #1 ($length) must be greater than 0
+Uncaught ValueError: random_bytes(): Argument #1 ($length) must be greater than 0

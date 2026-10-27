@@ -20,6 +20,9 @@
 #ifndef MINIPHP_NO_SQLITE
 #include "sqlite/sqlite3.h"
 #endif
+#ifdef MINIPHP_SODIUM
+#include <sodium.h>       /* bundled in libsodium/, built by make SODIUM=1 */
+#endif
 
 enum {
     T_NULL, T_INT, T_FLOAT, T_BOOL, T_STRING, T_ARRAY
@@ -301,6 +304,9 @@ static char* read_all(FILE* f);
 static char* preprocess_source(const char* src);
 static Value* call_user(Func* f, Value** args, int argc);
 static Value* builtin(const char* name, Value** args, int argc);
+#ifdef MINIPHP_SODIUM
+static int sodium_constant(const char* name, Node* n);
+#endif
 
 static void emit_string(const char* s);
 static void add_response_header_ex(const char* line, int replace);
@@ -1587,6 +1593,14 @@ static Node* parse_primary(void) {
                 n->l1 = args;
                 return n;
             }
+
+#ifdef MINIPHP_SODIUM
+            {
+                Node* c = new_node(NT_INT);
+                if (sodium_constant(name, c)) return c;
+                free(c);
+            }
+#endif
 
             /* Magic constants, fixed per file when it is parsed -- the
                standard include idiom is include __DIR__ . "/lib.php". They
@@ -3709,8 +3723,14 @@ static void apply_memory_limit(void) {
 
     struct rlimit rl;
     size_t base = current_data_bytes();
-    rl.rlim_cur = (rlim_t)(base + (size_t)lim);
-    rl.rlim_max = rl.rlim_cur + ((rlim_t)16 << 20);     /* headroom for the error path */
+    /* Only the soft limit is lowered. The hard one stays, so the error path
+       can raise the soft limit to report, and libsodium's Argon2 can be given
+       its working memory for one call (PHP does not count that either). A
+       script has no way to call setrlimit itself. */
+    if (getrlimit(RLIMIT_DATA, &rl) != 0) return;
+    rlim_t want = (rlim_t)(base + (size_t)lim);
+    if (rl.rlim_max != RLIM_INFINITY && want > rl.rlim_max) want = rl.rlim_max;
+    rl.rlim_cur = want;
     if (setrlimit(RLIMIT_DATA, &rl) == 0) mem_limit_bytes = (size_t)lim;
 }
 
@@ -4189,11 +4209,1098 @@ static Value* sqlite_builtin(const char* name, Value** args, int argc, int* hand
 }
 #endif
 
+#ifdef MINIPHP_SODIUM
+/* ---------- libsodium (make SODIUM=1) ----------
+   PHP's sodium extension, function for function: same names, arguments,
+   return values and errors, checked byte for byte against PHP 8.3's own
+   ext/sodium. Where PHP throws SodiumException the call is a fatal error
+   with PHP's message, as elsewhere in this file (no exceptions here).
+
+   Key pairs are concatenations, as in PHP: box and kx key pairs are
+   secret(32) . public(32); a sign key pair is secret(64) . public(32). */
+
+typedef struct { const char* fn; Value** a; int c; } Sod;
+
+static void sod_throw(const char* msg) {
+    fatal("Uncaught SodiumException: %s", msg);
+}
+
+static void sod_argerr(Sod* k, int i, const char* pname, const char* msg) {
+    fatal("Uncaught SodiumException: %s(): Argument #%d ($%s) %s", k->fn, i, pname, msg);
+}
+
+/* PHP's ArgumentCountError wording */
+static void sod_argc(Sod* k, int min, int max) {
+    if (k->c >= min && k->c <= max) return;
+    const char* how = min == max ? "exactly" : k->c < min ? "at least" : "at most";
+    int n = k->c < min ? min : max;
+    fatal("Uncaught ArgumentCountError: %s() expects %s %d argument%s, %d given",
+          k->fn, how, n, n == 1 ? "" : "s", k->c);
+}
+
+/* String argument i (1-based) as bytes, malloc'd with a terminating zero.
+   A missing optional one is "". Numbers convert as in PHP; an array is
+   PHP's TypeError. */
+static unsigned char* sod_str(Sod* k, int i, const char* pname, size_t* n) {
+    if (i > k->c) { *n = 0; return (unsigned char*)xstrdup(""); }
+    Value* v = k->a[i - 1];
+    if (v && v->type == T_ARRAY)
+        fatal("Uncaught TypeError: %s(): Argument #%d ($%s) must be of type string, array given",
+              k->fn, i, pname);
+    return (unsigned char*)val_bin(v, n);
+}
+
+static long long sod_int(Sod* k, int i, const char* pname, long long def) {
+    if (i > k->c) return def;
+    Value* v = k->a[i - 1];
+    if (v && v->type == T_ARRAY)
+        fatal("Uncaught TypeError: %s(): Argument #%d ($%s) must be of type int, array given",
+              k->fn, i, pname);
+    /* not a number, or one too big for an int: PHP's TypeError */
+    double d = v && v->type == T_FLOAT ? v->d
+             : v && v->type == T_STRING && val_is_numeric(v) ? strtod(v->s, 0) : 0;
+    if ((v && v->type == T_STRING && !val_is_numeric(v)) ||
+        !(d >= -9223372036854775808.0 && d < 9223372036854775808.0))
+        fatal("Uncaught TypeError: %s(): Argument #%d ($%s) must be of type int, %s given",
+              k->fn, i, pname, v->type == T_FLOAT ? "float" : "string");
+    return val_to_int(v);
+}
+
+/* "must be SODIUM_CRYPTO_..._KEYBYTES bytes long" */
+static void sod_len(Sod* k, int i, const char* pname, size_t got, size_t want, const char* cname) {
+    if (got == want) return;
+    char m[160];
+    snprintf(m, sizeof m, "must be %s bytes long", cname);
+    sod_argerr(k, i, pname, m);
+}
+
+/* Inputs often hold keys: wipe before freeing */
+static void sod_free(unsigned char* p, size_t n) {
+    if (!p) return;
+    sodium_memzero(p, n);
+    free(p);
+}
+
+static unsigned char* sod_buf(size_t n) {
+    unsigned char* p = malloc(n + 1);
+    p[n] = 0;
+    return p;
+}
+
+static Value* sod_ret(unsigned char* p, size_t n) {
+    p[n] = 0;
+    return v_str_own((char*)p, n);
+}
+
+/* A by-reference string argument (&$state): the caller's own variable,
+   since builtins receive the stored value. Replaced in place. */
+static Value* sod_ref(Sod* k, int i) {
+    return i <= k->c ? k->a[i - 1] : 0;
+}
+
+static void sod_set(Value* v, const unsigned char* p, size_t n) {
+    if (v->type == T_STRING && v->s) { sodium_memzero(v->s, slen(v)); free(v->s); }
+    v->type = T_STRING;
+    v->s = (char*)sod_buf(n);
+    memcpy(v->s, p, n);
+    v->n = n;
+}
+
+static void sod_null(Value* v) {
+    if (v->type == T_STRING && v->s) { sodium_memzero(v->s, slen(v)); free(v->s); }
+    v->type = T_NULL;
+    v->s = 0;
+    v->n = SIZE_MAX;
+}
+
+static Value* sod_pair(Value* x, Value* y) {
+    Value* arr = v_new(T_ARRAY);
+    array_put(arr, v_int(0), x);
+    array_put(arr, v_int(1), y);
+    return arr;
+}
+
+/* Argon2 works in its own memory (64 MB at "interactive", 1 GB at
+   "sensitive"), which PHP does not count against memory_limit. Lift the
+   limit by exactly that much for the call, then put it back. */
+static void sod_lift_limit(size_t extra, struct rlimit* saved) {
+    getrlimit(RLIMIT_DATA, saved);
+    if (saved->rlim_cur == RLIM_INFINITY) return;
+    struct rlimit r = *saved;
+    r.rlim_cur = saved->rlim_cur + extra;
+    if (r.rlim_max != RLIM_INFINITY && r.rlim_cur > r.rlim_max) r.rlim_cur = r.rlim_max;
+    setrlimit(RLIMIT_DATA, &r);
+}
+
+static void sod_restore_limit(struct rlimit* saved) {
+    if (saved->rlim_cur != RLIM_INFINITY) setrlimit(RLIMIT_DATA, saved);
+}
+
+/* sodium_*_keygen(): every one is random bytes of the key size */
+static const struct { const char* name; size_t len; } sod_keygens[] = {
+    { "sodium_crypto_aead_aes256gcm_keygen",                 crypto_aead_aes256gcm_KEYBYTES },
+    { "sodium_crypto_aead_chacha20poly1305_keygen",          crypto_aead_chacha20poly1305_KEYBYTES },
+    { "sodium_crypto_aead_chacha20poly1305_ietf_keygen",     crypto_aead_chacha20poly1305_ietf_KEYBYTES },
+    { "sodium_crypto_aead_xchacha20poly1305_ietf_keygen",    crypto_aead_xchacha20poly1305_ietf_KEYBYTES },
+    { "sodium_crypto_auth_keygen",                           crypto_auth_KEYBYTES },
+    { "sodium_crypto_generichash_keygen",                    crypto_generichash_KEYBYTES },
+    { "sodium_crypto_kdf_keygen",                            crypto_kdf_KEYBYTES },
+    { "sodium_crypto_secretbox_keygen",                      crypto_secretbox_KEYBYTES },
+    { "sodium_crypto_shorthash_keygen",                      crypto_shorthash_KEYBYTES },
+    { "sodium_crypto_stream_keygen",                         crypto_stream_KEYBYTES },
+    { "sodium_crypto_stream_xchacha20_keygen",               crypto_stream_xchacha20_KEYBYTES },
+    { "sodium_crypto_secretstream_xchacha20poly1305_keygen", crypto_secretstream_xchacha20poly1305_KEYBYTES },
+};
+
+/* The three ChaCha20-Poly1305 AEAD flavours share one shape */
+typedef int (*sod_aead_enc)(unsigned char*, unsigned long long*, const unsigned char*, unsigned long long,
+                            const unsigned char*, unsigned long long, const unsigned char*,
+                            const unsigned char*, const unsigned char*);
+typedef int (*sod_aead_dec)(unsigned char*, unsigned long long*, unsigned char*, const unsigned char*,
+                            unsigned long long, const unsigned char*, unsigned long long,
+                            const unsigned char*, const unsigned char*);
+static const struct {
+    const char* name;       /* after "sodium_crypto_aead_" */
+    sod_aead_enc enc;
+    sod_aead_dec dec;
+    size_t npub, key, abytes;
+    const char *npub_c, *key_c;
+    int ietf_limit;         /* 64 * 2^32 - 64 bytes per message */
+} sod_aeads[] = {
+    { "chacha20poly1305", crypto_aead_chacha20poly1305_encrypt, crypto_aead_chacha20poly1305_decrypt,
+      crypto_aead_chacha20poly1305_NPUBBYTES, crypto_aead_chacha20poly1305_KEYBYTES,
+      crypto_aead_chacha20poly1305_ABYTES,
+      "SODIUM_CRYPTO_AEAD_CHACHA20POLY1305_NPUBBYTES", "SODIUM_CRYPTO_AEAD_CHACHA20POLY1305_KEYBYTES", 0 },
+    { "chacha20poly1305_ietf", crypto_aead_chacha20poly1305_ietf_encrypt, crypto_aead_chacha20poly1305_ietf_decrypt,
+      crypto_aead_chacha20poly1305_ietf_NPUBBYTES, crypto_aead_chacha20poly1305_ietf_KEYBYTES,
+      crypto_aead_chacha20poly1305_ietf_ABYTES,
+      "SODIUM_CRYPTO_AEAD_CHACHA20POLY1305_IETF_NPUBBYTES", "SODIUM_CRYPTO_AEAD_CHACHA20POLY1305_IETF_KEYBYTES", 1 },
+    { "xchacha20poly1305_ietf", crypto_aead_xchacha20poly1305_ietf_encrypt, crypto_aead_xchacha20poly1305_ietf_decrypt,
+      crypto_aead_xchacha20poly1305_ietf_NPUBBYTES, crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
+      crypto_aead_xchacha20poly1305_ietf_ABYTES,
+      "SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NPUBBYTES", "SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_KEYBYTES", 0 },
+};
+
+static Value* sodium_builtin(const char* name, Value** args, int argc, int* handled) {
+    Sod K = { name, args, argc }, *k = &K;
+    *handled = 1;
+    size_t n1, n2, n3, n4;
+    unsigned char *s1, *s2, *s3, *s4, *out;
+
+    for (size_t i = 0; i < sizeof sod_keygens / sizeof sod_keygens[0]; i++) {
+        if (strcmp(name, sod_keygens[i].name)) continue;
+        sod_argc(k, 0, 0);
+        out = sod_buf(sod_keygens[i].len);
+        randombytes_buf(out, sod_keygens[i].len);
+        return sod_ret(out, sod_keygens[i].len);
+    }
+
+    if (!strncmp(name, "sodium_crypto_aead_", 19)) {
+        const char* rest = name + 19;
+        if (!strcmp(rest, "aes256gcm_is_available")) {
+            sod_argc(k, 0, 0);
+            return v_bool(0);   /* the portable build has no AES-NI code path */
+        }
+        for (size_t i = 0; i < sizeof sod_aeads / sizeof sod_aeads[0]; i++) {
+            size_t bl = strlen(sod_aeads[i].name);
+            if (strncmp(rest, sod_aeads[i].name, bl)) continue;
+            int enc = !strcmp(rest + bl, "_encrypt");
+            if (!enc && strcmp(rest + bl, "_decrypt")) continue;
+            sod_argc(k, 4, 4);
+            s1 = sod_str(k, 1, enc ? "message" : "ciphertext", &n1);
+            s2 = sod_str(k, 2, "additional_data", &n2);
+            s3 = sod_str(k, 3, "nonce", &n3);
+            s4 = sod_str(k, 4, "key", &n4);
+            sod_len(k, 3, "nonce", n3, sod_aeads[i].npub, sod_aeads[i].npub_c);
+            sod_len(k, 4, "key", n4, sod_aeads[i].key, sod_aeads[i].key_c);
+            Value* r;
+            unsigned long long rl = 0;
+            if (enc) {
+                if ((unsigned long long)n1 > 64ULL * (1ULL << 32) - 64ULL && sod_aeads[i].ietf_limit)
+                    sod_throw("message too long for a single key");
+                out = sod_buf(n1 + sod_aeads[i].abytes);
+                if (sod_aeads[i].enc(out, &rl, s1, n1, s2, n2, 0, s3, s4) != 0) sod_throw("internal error");
+                r = sod_ret(out, (size_t)rl);
+            } else if (n1 < sod_aeads[i].abytes) {
+                r = v_bool(0);
+            } else {
+                out = sod_buf(n1 - sod_aeads[i].abytes);
+                if (sod_aeads[i].dec(out, &rl, 0, s1, n1, s2, n2, s3, s4) != 0) { free(out); r = v_bool(0); }
+                else r = sod_ret(out, (size_t)rl);
+            }
+            sod_free(s1, n1); sod_free(s2, n2); sod_free(s3, n3); sod_free(s4, n4);
+            return r;
+        }
+        *handled = 0;
+        return 0;
+    }
+
+    /* ---- secretbox: XSalsa20-Poly1305 ---- */
+
+    if (!strcmp(name, "sodium_crypto_secretbox") || !strcmp(name, "sodium_crypto_secretbox_open")) {
+        int open = name[23] == '_';
+        sod_argc(k, 3, 3);
+        s1 = sod_str(k, 1, open ? "ciphertext" : "message", &n1);
+        s2 = sod_str(k, 2, "nonce", &n2);
+        s3 = sod_str(k, 3, "key", &n3);
+        sod_len(k, 2, "nonce", n2, crypto_secretbox_NONCEBYTES, "SODIUM_CRYPTO_SECRETBOX_NONCEBYTES");
+        sod_len(k, 3, "key", n3, crypto_secretbox_KEYBYTES, "SODIUM_CRYPTO_SECRETBOX_KEYBYTES");
+        Value* r;
+        if (!open) {
+            out = sod_buf(n1 + crypto_secretbox_MACBYTES);
+            if (crypto_secretbox_easy(out, s1, n1, s2, s3) != 0) sod_throw("internal error");
+            r = sod_ret(out, n1 + crypto_secretbox_MACBYTES);
+        } else if (n1 < crypto_secretbox_MACBYTES) {
+            r = v_bool(0);
+        } else {
+            out = sod_buf(n1 - crypto_secretbox_MACBYTES);
+            if (crypto_secretbox_open_easy(out, s1, n1, s2, s3) != 0) { free(out); r = v_bool(0); }
+            else r = sod_ret(out, n1 - crypto_secretbox_MACBYTES);
+        }
+        sod_free(s1, n1); sod_free(s2, n2); sod_free(s3, n3);
+        return r;
+    }
+
+    /* ---- box: X25519 + XSalsa20-Poly1305 ---- */
+
+    if (!strcmp(name, "sodium_crypto_box_keypair") || !strcmp(name, "sodium_crypto_kx_keypair")) {
+        sod_argc(k, 0, 0);
+        out = sod_buf(64);
+        if (name[14] == 'b' ? crypto_box_keypair(out + 32, out) : crypto_kx_keypair(out + 32, out))
+            sod_throw("internal error");
+        return sod_ret(out, 64);
+    }
+
+    if (!strcmp(name, "sodium_crypto_box_seed_keypair") || !strcmp(name, "sodium_crypto_kx_seed_keypair")) {
+        int box = name[14] == 'b';
+        sod_argc(k, 1, 1);
+        s1 = sod_str(k, 1, "seed", &n1);
+        sod_len(k, 1, "seed", n1, 32, box ? "SODIUM_CRYPTO_BOX_SEEDBYTES" : "SODIUM_CRYPTO_KX_SEEDBYTES");
+        out = sod_buf(64);
+        if (box ? crypto_box_seed_keypair(out + 32, out, s1) : crypto_kx_seed_keypair(out + 32, out, s1))
+            sod_throw("internal error");
+        sod_free(s1, n1);
+        return sod_ret(out, 64);
+    }
+
+    if (!strcmp(name, "sodium_crypto_box_keypair_from_secretkey_and_publickey")) {
+        sod_argc(k, 2, 2);
+        s1 = sod_str(k, 1, "secret_key", &n1);
+        s2 = sod_str(k, 2, "public_key", &n2);
+        sod_len(k, 1, "secret_key", n1, crypto_box_SECRETKEYBYTES, "SODIUM_CRYPTO_BOX_SECRETKEYBYTES");
+        sod_len(k, 2, "public_key", n2, crypto_box_PUBLICKEYBYTES, "SODIUM_CRYPTO_BOX_PUBLICKEYBYTES");
+        out = sod_buf(64);
+        memcpy(out, s1, 32);
+        memcpy(out + 32, s2, 32);
+        sod_free(s1, n1); sod_free(s2, n2);
+        return sod_ret(out, 64);
+    }
+
+    /* the halves of a 64-byte box or kx key pair */
+    if (!strcmp(name, "sodium_crypto_box_secretkey") || !strcmp(name, "sodium_crypto_box_publickey") ||
+        !strcmp(name, "sodium_crypto_kx_secretkey") || !strcmp(name, "sodium_crypto_kx_publickey")) {
+        int box = name[14] == 'b', pub = strstr(name, "publickey") != 0;
+        sod_argc(k, 1, 1);
+        s1 = sod_str(k, 1, "key_pair", &n1);
+        sod_len(k, 1, "key_pair", n1, 64, box ? "SODIUM_CRYPTO_BOX_KEYPAIRBYTES" : "SODIUM_CRYPTO_KX_KEYPAIRBYTES");
+        out = sod_buf(32);
+        memcpy(out, s1 + (pub ? 32 : 0), 32);
+        sod_free(s1, n1);
+        return sod_ret(out, 32);
+    }
+
+    if (!strcmp(name, "sodium_crypto_box_publickey_from_secretkey") ||
+        !strcmp(name, "sodium_crypto_scalarmult_base")) {
+        sod_argc(k, 1, 1);
+        s1 = sod_str(k, 1, "secret_key", &n1);
+        /* sic: PHP names the box constant for scalarmult_base too */
+        sod_len(k, 1, "secret_key", n1, 32, "SODIUM_CRYPTO_BOX_SECRETKEYBYTES");
+        out = sod_buf(32);
+        crypto_scalarmult_base(out, s1);
+        sod_free(s1, n1);
+        return sod_ret(out, 32);
+    }
+
+    if (!strcmp(name, "sodium_crypto_box") || !strcmp(name, "sodium_crypto_box_open")) {
+        int open = name[17] == '_';
+        sod_argc(k, 3, 3);
+        s1 = sod_str(k, 1, open ? "ciphertext" : "message", &n1);
+        s2 = sod_str(k, 2, "nonce", &n2);
+        s3 = sod_str(k, 3, "key_pair", &n3);
+        sod_len(k, 2, "nonce", n2, crypto_box_NONCEBYTES, "SODIUM_CRYPTO_BOX_NONCEBYTES");
+        sod_len(k, 3, "key_pair", n3, 64, "SODIUM_CRYPTO_BOX_KEYPAIRBYTES");
+        Value* r;
+        if (!open) {
+            out = sod_buf(n1 + crypto_box_MACBYTES);
+            if (crypto_box_easy(out, s1, n1, s2, s3 + 32, s3) != 0) sod_throw("internal error");
+            r = sod_ret(out, n1 + crypto_box_MACBYTES);
+        } else if (n1 < crypto_box_MACBYTES) {
+            r = v_bool(0);
+        } else {
+            out = sod_buf(n1 - crypto_box_MACBYTES);
+            if (crypto_box_open_easy(out, s1, n1, s2, s3 + 32, s3) != 0) { free(out); r = v_bool(0); }
+            else r = sod_ret(out, n1 - crypto_box_MACBYTES);
+        }
+        sod_free(s1, n1); sod_free(s2, n2); sod_free(s3, n3);
+        return r;
+    }
+
+    if (!strcmp(name, "sodium_crypto_box_seal")) {
+        sod_argc(k, 2, 2);
+        s1 = sod_str(k, 1, "message", &n1);
+        s2 = sod_str(k, 2, "public_key", &n2);
+        sod_len(k, 2, "public_key", n2, crypto_box_PUBLICKEYBYTES, "SODIUM_CRYPTO_BOX_PUBLICKEYBYTES");
+        out = sod_buf(n1 + crypto_box_SEALBYTES);
+        if (crypto_box_seal(out, s1, n1, s2) != 0) sod_throw("internal error");
+        sod_free(s1, n1); sod_free(s2, n2);
+        return sod_ret(out, n1 + crypto_box_SEALBYTES);
+    }
+
+    if (!strcmp(name, "sodium_crypto_box_seal_open")) {
+        sod_argc(k, 2, 2);
+        s1 = sod_str(k, 1, "ciphertext", &n1);
+        s2 = sod_str(k, 2, "key_pair", &n2);
+        sod_len(k, 2, "key_pair", n2, 64, "SODIUM_CRYPTO_BOX_KEYPAIRBYTES");
+        Value* r;
+        if (n1 < crypto_box_SEALBYTES) r = v_bool(0);
+        else {
+            out = sod_buf(n1 - crypto_box_SEALBYTES);
+            if (crypto_box_seal_open(out, s1, n1, s2 + 32, s2) != 0) { free(out); r = v_bool(0); }
+            else r = sod_ret(out, n1 - crypto_box_SEALBYTES);
+        }
+        sod_free(s1, n1); sod_free(s2, n2);
+        return r;
+    }
+
+    if (!strcmp(name, "sodium_crypto_scalarmult")) {
+        sod_argc(k, 2, 2);
+        s1 = sod_str(k, 1, "n", &n1);
+        s2 = sod_str(k, 2, "p", &n2);
+        sod_len(k, 1, "n", n1, crypto_scalarmult_SCALARBYTES, "SODIUM_CRYPTO_SCALARMULT_SCALARBYTES");
+        /* sic: PHP names the scalar size for the point too */
+        sod_len(k, 2, "p", n2, crypto_scalarmult_BYTES, "SODIUM_CRYPTO_SCALARMULT_SCALARBYTES");
+        out = sod_buf(crypto_scalarmult_BYTES);
+        if (crypto_scalarmult(out, s1, s2) != 0) sod_throw("internal error");
+        sod_free(s1, n1); sod_free(s2, n2);
+        return sod_ret(out, crypto_scalarmult_BYTES);
+    }
+
+    /* ---- kx: session keys from X25519 ---- */
+
+    if (!strcmp(name, "sodium_crypto_kx_client_session_keys") ||
+        !strcmp(name, "sodium_crypto_kx_server_session_keys")) {
+        int client = name[17] == 'c';
+        sod_argc(k, 2, 2);
+        s1 = sod_str(k, 1, client ? "client_key_pair" : "server_key_pair", &n1);
+        s2 = sod_str(k, 2, client ? "server_key" : "client_key", &n2);
+        sod_len(k, 1, client ? "client_key_pair" : "server_key_pair", n1, 64, "SODIUM_CRYPTO_KX_KEYPAIRBYTES");
+        sod_len(k, 2, client ? "server_key" : "client_key", n2, 32, "SODIUM_CRYPTO_KX_PUBLICKEYBYTES");
+        unsigned char* rx = sod_buf(32);
+        unsigned char* tx = sod_buf(32);
+        if ((client ? crypto_kx_client_session_keys : crypto_kx_server_session_keys)(rx, tx, s1 + 32, s1, s2) != 0)
+            sod_throw("internal error");
+        sod_free(s1, n1); sod_free(s2, n2);
+        return sod_pair(sod_ret(rx, 32), sod_ret(tx, 32));
+    }
+
+    /* ---- sign: Ed25519 ---- */
+
+    if (!strcmp(name, "sodium_crypto_sign_keypair")) {
+        sod_argc(k, 0, 0);
+        out = sod_buf(96);
+        if (crypto_sign_keypair(out + 64, out) != 0) sod_throw("internal error");
+        return sod_ret(out, 96);
+    }
+
+    if (!strcmp(name, "sodium_crypto_sign_seed_keypair")) {
+        sod_argc(k, 1, 1);
+        s1 = sod_str(k, 1, "seed", &n1);
+        sod_len(k, 1, "seed", n1, crypto_sign_SEEDBYTES, "SODIUM_CRYPTO_SIGN_SEEDBYTES");
+        out = sod_buf(96);
+        if (crypto_sign_seed_keypair(out + 64, out, s1) != 0) sod_throw("internal error");
+        sod_free(s1, n1);
+        return sod_ret(out, 96);
+    }
+
+    if (!strcmp(name, "sodium_crypto_sign_keypair_from_secretkey_and_publickey")) {
+        sod_argc(k, 2, 2);
+        s1 = sod_str(k, 1, "secret_key", &n1);
+        s2 = sod_str(k, 2, "public_key", &n2);
+        sod_len(k, 1, "secret_key", n1, crypto_sign_SECRETKEYBYTES, "SODIUM_CRYPTO_SIGN_SECRETKEYBYTES");
+        sod_len(k, 2, "public_key", n2, crypto_sign_PUBLICKEYBYTES, "SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES");
+        out = sod_buf(96);
+        memcpy(out, s1, 64);
+        memcpy(out + 64, s2, 32);
+        sod_free(s1, n1); sod_free(s2, n2);
+        return sod_ret(out, 96);
+    }
+
+    if (!strcmp(name, "sodium_crypto_sign_secretkey") || !strcmp(name, "sodium_crypto_sign_publickey")) {
+        int pub = name[19] == 'p';
+        sod_argc(k, 1, 1);
+        s1 = sod_str(k, 1, "key_pair", &n1);
+        sod_len(k, 1, "key_pair", n1, 96, "SODIUM_CRYPTO_SIGN_KEYPAIRBYTES");
+        size_t len = pub ? 32 : 64;
+        out = sod_buf(len);
+        memcpy(out, s1 + (pub ? 64 : 0), len);
+        sod_free(s1, n1);
+        return sod_ret(out, len);
+    }
+
+    if (!strcmp(name, "sodium_crypto_sign_publickey_from_secretkey") ||
+        !strcmp(name, "sodium_crypto_sign_ed25519_sk_to_curve25519")) {
+        int conv = name[19] == 'e';
+        sod_argc(k, 1, 1);
+        s1 = sod_str(k, 1, "secret_key", &n1);
+        sod_len(k, 1, "secret_key", n1, crypto_sign_SECRETKEYBYTES, "SODIUM_CRYPTO_SIGN_SECRETKEYBYTES");
+        out = sod_buf(32);
+        if (conv ? crypto_sign_ed25519_sk_to_curve25519(out, s1) : crypto_sign_ed25519_sk_to_pk(out, s1))
+            sod_throw(conv ? "conversion failed" : "internal error");
+        sod_free(s1, n1);
+        return sod_ret(out, 32);
+    }
+
+    if (!strcmp(name, "sodium_crypto_sign_ed25519_pk_to_curve25519")) {
+        sod_argc(k, 1, 1);
+        s1 = sod_str(k, 1, "public_key", &n1);
+        sod_len(k, 1, "public_key", n1, crypto_sign_PUBLICKEYBYTES, "SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES");
+        out = sod_buf(32);
+        if (crypto_sign_ed25519_pk_to_curve25519(out, s1) != 0) sod_throw("conversion failed");
+        sod_free(s1, n1);
+        return sod_ret(out, 32);
+    }
+
+    if (!strcmp(name, "sodium_crypto_sign") || !strcmp(name, "sodium_crypto_sign_detached")) {
+        int det = name[18] == '_';
+        sod_argc(k, 2, 2);
+        s1 = sod_str(k, 1, "message", &n1);
+        s2 = sod_str(k, 2, "secret_key", &n2);
+        sod_len(k, 2, "secret_key", n2, crypto_sign_SECRETKEYBYTES, "SODIUM_CRYPTO_SIGN_SECRETKEYBYTES");
+        unsigned long long rl = 0;
+        if (det) {
+            out = sod_buf(crypto_sign_BYTES);
+            if (crypto_sign_detached(out, &rl, s1, n1, s2) != 0) sod_throw("signature creation failed");
+        } else {
+            out = sod_buf(n1 + crypto_sign_BYTES);
+            if (crypto_sign(out, &rl, s1, n1, s2) != 0) sod_throw("internal error");
+        }
+        sod_free(s1, n1); sod_free(s2, n2);
+        return sod_ret(out, (size_t)rl);
+    }
+
+    if (!strcmp(name, "sodium_crypto_sign_open")) {
+        sod_argc(k, 2, 2);
+        s1 = sod_str(k, 1, "signed_message", &n1);
+        s2 = sod_str(k, 2, "public_key", &n2);
+        sod_len(k, 2, "public_key", n2, crypto_sign_PUBLICKEYBYTES, "SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES");
+        unsigned long long rl = 0;
+        out = sod_buf(n1);
+        Value* r;
+        if (crypto_sign_open(out, &rl, s1, n1, s2) != 0) { free(out); r = v_bool(0); }
+        else r = sod_ret(out, (size_t)rl);
+        sod_free(s1, n1); sod_free(s2, n2);
+        return r;
+    }
+
+    if (!strcmp(name, "sodium_crypto_sign_verify_detached")) {
+        sod_argc(k, 3, 3);
+        s1 = sod_str(k, 1, "signature", &n1);
+        s2 = sod_str(k, 2, "message", &n2);
+        s3 = sod_str(k, 3, "public_key", &n3);
+        sod_len(k, 1, "signature", n1, crypto_sign_BYTES, "SODIUM_CRYPTO_SIGN_BYTES");
+        sod_len(k, 3, "public_key", n3, crypto_sign_PUBLICKEYBYTES, "SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES");
+        int ok = crypto_sign_verify_detached(s1, s2, n2, s3) == 0;
+        sod_free(s1, n1); sod_free(s2, n2); sod_free(s3, n3);
+        return v_bool(ok);
+    }
+
+    /* ---- generichash: BLAKE2b ---- */
+
+    if (!strcmp(name, "sodium_crypto_generichash")) {
+        sod_argc(k, 1, 3);
+        s1 = sod_str(k, 1, "message", &n1);
+        s2 = sod_str(k, 2, "key", &n2);
+        long long len = sod_int(k, 3, "length", crypto_generichash_BYTES);
+        if (len < crypto_generichash_BYTES_MIN || len > crypto_generichash_BYTES_MAX)
+            sod_throw("unsupported output length");
+        if (n2 && (n2 < crypto_generichash_KEYBYTES_MIN || n2 > crypto_generichash_KEYBYTES_MAX))
+            sod_throw("unsupported key length");
+        out = sod_buf((size_t)len);
+        if (crypto_generichash(out, (size_t)len, s1, n1, n2 ? s2 : 0, n2) != 0) sod_throw("internal error");
+        sod_free(s1, n1); sod_free(s2, n2);
+        return sod_ret(out, (size_t)len);
+    }
+
+    /* The streaming state is a string holding the raw libsodium state, as in
+       PHP. _update and _final take it by reference; _final wipes it to null. */
+    if (!strcmp(name, "sodium_crypto_generichash_init")) {
+        sod_argc(k, 0, 2);
+        s1 = sod_str(k, 1, "key", &n1);
+        long long len = sod_int(k, 2, "length", crypto_generichash_BYTES);
+        if (len < crypto_generichash_BYTES_MIN || len > crypto_generichash_BYTES_MAX)
+            sod_throw("unsupported output length");
+        if (n1 && (n1 < crypto_generichash_KEYBYTES_MIN || n1 > crypto_generichash_KEYBYTES_MAX))
+            sod_throw("unsupported key length");
+        crypto_generichash_state st;
+        if (crypto_generichash_init(&st, n1 ? s1 : 0, n1, (size_t)len) != 0) sod_throw("internal error");
+        out = sod_buf(sizeof st);
+        memcpy(out, &st, sizeof st);
+        sodium_memzero(&st, sizeof st);
+        sod_free(s1, n1);
+        return sod_ret(out, sizeof st);
+    }
+
+    if (!strcmp(name, "sodium_crypto_generichash_update") || !strcmp(name, "sodium_crypto_generichash_final")) {
+        int fin = name[26] == 'f';
+        if (fin) sod_argc(k, 1, 2); else sod_argc(k, 2, 2);
+        Value* sv = sod_ref(k, 1);
+        if (!sv || sv->type != T_STRING) sod_argerr(k, 1, "state", "must be a reference to a state");
+        crypto_generichash_state st;
+        if (slen(sv) != sizeof st) sod_throw("incorrect state length");
+        if (!fin) {
+            s2 = sod_str(k, 2, "message", &n2);
+            memcpy(&st, sv->s, sizeof st);
+            if (crypto_generichash_update(&st, s2, n2) != 0) sod_throw("internal error");
+            sod_set(sv, (unsigned char*)&st, sizeof st);
+            sodium_memzero(&st, sizeof st);
+            sod_free(s2, n2);
+            return v_bool(1);
+        }
+        long long len = sod_int(k, 2, "length", crypto_generichash_BYTES);
+        if (len < crypto_generichash_BYTES_MIN || len > crypto_generichash_BYTES_MAX)
+            sod_throw("unsupported output length");
+        memcpy(&st, sv->s, sizeof st);
+        out = sod_buf((size_t)len);
+        if (crypto_generichash_final(&st, out, (size_t)len) != 0) sod_throw("internal error");
+        sodium_memzero(&st, sizeof st);
+        sod_null(sv);
+        return sod_ret(out, (size_t)len);
+    }
+
+    /* ---- auth (HMAC-SHA512-256), shorthash (SipHash-2-4), kdf ---- */
+
+    if (!strcmp(name, "sodium_crypto_auth")) {
+        sod_argc(k, 2, 2);
+        s1 = sod_str(k, 1, "message", &n1);
+        s2 = sod_str(k, 2, "key", &n2);
+        sod_len(k, 2, "key", n2, crypto_auth_KEYBYTES, "SODIUM_CRYPTO_AUTH_KEYBYTES");
+        out = sod_buf(crypto_auth_BYTES);
+        if (crypto_auth(out, s1, n1, s2) != 0) sod_throw("internal error");
+        sod_free(s1, n1); sod_free(s2, n2);
+        return sod_ret(out, crypto_auth_BYTES);
+    }
+
+    if (!strcmp(name, "sodium_crypto_auth_verify")) {
+        sod_argc(k, 3, 3);
+        s1 = sod_str(k, 1, "mac", &n1);
+        s2 = sod_str(k, 2, "message", &n2);
+        s3 = sod_str(k, 3, "key", &n3);
+        sod_len(k, 3, "key", n3, crypto_auth_KEYBYTES, "SODIUM_CRYPTO_AUTH_KEYBYTES");
+        sod_len(k, 1, "mac", n1, crypto_auth_BYTES, "SODIUM_CRYPTO_AUTH_BYTES");
+        int ok = crypto_auth_verify(s1, s2, n2, s3) == 0;
+        sod_free(s1, n1); sod_free(s2, n2); sod_free(s3, n3);
+        return v_bool(ok);
+    }
+
+    if (!strcmp(name, "sodium_crypto_shorthash")) {
+        sod_argc(k, 2, 2);
+        s1 = sod_str(k, 1, "message", &n1);
+        s2 = sod_str(k, 2, "key", &n2);
+        sod_len(k, 2, "key", n2, crypto_shorthash_KEYBYTES, "SODIUM_CRYPTO_SHORTHASH_KEYBYTES");
+        out = sod_buf(crypto_shorthash_BYTES);
+        if (crypto_shorthash(out, s1, n1, s2) != 0) sod_throw("internal error");
+        sod_free(s1, n1); sod_free(s2, n2);
+        return sod_ret(out, crypto_shorthash_BYTES);
+    }
+
+    if (!strcmp(name, "sodium_crypto_kdf_derive_from_key")) {
+        sod_argc(k, 4, 4);
+        long long len = sod_int(k, 1, "subkey_length", 0);
+        long long id = sod_int(k, 2, "subkey_id", 0);
+        s3 = sod_str(k, 3, "context", &n3);
+        s4 = sod_str(k, 4, "key", &n4);
+        if (len < crypto_kdf_BYTES_MIN)
+            sod_argerr(k, 1, "subkey_length", "must be greater than or equal to SODIUM_CRYPTO_KDF_BYTES_MIN");
+        if (len > crypto_kdf_BYTES_MAX)
+            sod_argerr(k, 1, "subkey_length", "must be less than or equal to SODIUM_CRYPTO_KDF_BYTES_MAX");
+        if (id < 0) sod_argerr(k, 2, "subkey_id", "must be greater than or equal to 0");
+        sod_len(k, 3, "context", n3, crypto_kdf_CONTEXTBYTES, "SODIUM_CRYPTO_KDF_CONTEXTBYTES");
+        /* sic: PHP's message names BYTES_MIN for the key length */
+        sod_len(k, 4, "key", n4, crypto_kdf_KEYBYTES, "SODIUM_CRYPTO_KDF_BYTES_MIN");
+        out = sod_buf((size_t)len);
+        if (crypto_kdf_derive_from_key(out, (size_t)len, (uint64_t)id, (const char*)s3, s4) != 0)
+            sod_throw("internal error");
+        sod_free(s3, n3); sod_free(s4, n4);
+        return sod_ret(out, (size_t)len);
+    }
+
+    /* ---- pwhash: Argon2 ---- */
+
+    if (!strcmp(name, "sodium_crypto_pwhash_str")) {
+        sod_argc(k, 3, 3);
+        s1 = sod_str(k, 1, "password", &n1);
+        long long ops = sod_int(k, 2, "opslimit", 0);
+        long long mem = sod_int(k, 3, "memlimit", 0);
+        if (ops <= 0) sod_argerr(k, 2, "opslimit", "must be greater than 0");
+        if (mem <= 0) sod_argerr(k, 3, "memlimit", "must be greater than 0");
+        if (n1 >= 0xffffffffUL) sod_argerr(k, 1, "password", "is too long");
+        if (!n1) fprintf(stderr, "PHP warning: empty password\n");
+        char m[80];
+        if ((unsigned long long)ops < crypto_pwhash_OPSLIMIT_MIN) {
+            snprintf(m, sizeof m, "must be greater than or equal to %d", (int)crypto_pwhash_OPSLIMIT_MIN);
+            sod_argerr(k, 2, "opslimit", m);
+        }
+        if ((unsigned long long)mem < crypto_pwhash_MEMLIMIT_MIN) {
+            snprintf(m, sizeof m, "must be greater than or equal to %d", (int)crypto_pwhash_MEMLIMIT_MIN);
+            sod_argerr(k, 3, "memlimit", m);
+        }
+        char h[crypto_pwhash_STRBYTES];
+        struct rlimit saved;
+        sod_lift_limit((size_t)mem, &saved);
+        int rc = crypto_pwhash_str(h, (const char*)s1, n1, (unsigned long long)ops, (size_t)mem);
+        sod_restore_limit(&saved);
+        if (rc != 0) sod_throw("internal error");
+        sod_free(s1, n1);
+        return v_str(h);
+    }
+
+    if (!strcmp(name, "sodium_crypto_pwhash_str_verify")) {
+        sod_argc(k, 2, 2);
+        s1 = sod_str(k, 1, "hash", &n1);
+        s2 = sod_str(k, 2, "password", &n2);
+        if (n2 >= 0xffffffffUL) sod_argerr(k, 2, "password", "is too long");
+        if (!n2) fprintf(stderr, "PHP warning: empty password\n");
+        /* the hash names its own memory cost; lift the limit by that much */
+        unsigned long long mem = 0;
+        const char* mp = strstr((const char*)s1, "$m=");
+        if (mp) mem = strtoull(mp + 3, 0, 10) * 1024ULL;
+        struct rlimit saved;
+        sod_lift_limit(mem < ((size_t)1 << 40) ? (size_t)mem : 0, &saved);
+        int ok = crypto_pwhash_str_verify((const char*)s1, (const char*)s2, n2) == 0;
+        sod_restore_limit(&saved);
+        sod_free(s1, n1); sod_free(s2, n2);
+        return v_bool(ok);
+    }
+
+    if (!strcmp(name, "sodium_crypto_pwhash_str_needs_rehash")) {
+        sod_argc(k, 3, 3);
+        s1 = sod_str(k, 1, "password", &n1);   /* sic: PHP names the hash $password */
+        long long ops = sod_int(k, 2, "opslimit", 0);
+        long long mem = sod_int(k, 3, "memlimit", 0);
+        int r = crypto_pwhash_str_needs_rehash((const char*)s1, (unsigned long long)ops, (size_t)mem) != 0;
+        sod_free(s1, n1);
+        return v_bool(r);
+    }
+
+    if (!strcmp(name, "sodium_crypto_pwhash")) {
+        sod_argc(k, 5, 6);
+        long long len = sod_int(k, 1, "length", 0);
+        s2 = sod_str(k, 2, "password", &n2);
+        s3 = sod_str(k, 3, "salt", &n3);
+        long long ops = sod_int(k, 4, "opslimit", 0);
+        long long mem = sod_int(k, 5, "memlimit", 0);
+        long long alg = sod_int(k, 6, "algo", crypto_pwhash_ALG_DEFAULT);
+        if (len <= 0) sod_argerr(k, 1, "length", "must be greater than 0");
+        if (len >= 0xffffffffLL) sod_argerr(k, 1, "length", "is too large");
+        if (n2 >= 0xffffffffUL) sod_argerr(k, 2, "password", "is too long");
+        if (ops <= 0) sod_argerr(k, 4, "opslimit", "must be greater than 0");
+        if (mem <= 0) sod_argerr(k, 5, "memlimit", "must be greater than 0");
+        if (alg != crypto_pwhash_ALG_ARGON2I13 && alg != crypto_pwhash_ALG_ARGON2ID13 &&
+            alg != crypto_pwhash_ALG_DEFAULT)
+            sod_throw("unsupported password hashing algorithm");
+        if (!n2) fprintf(stderr, "PHP warning: empty password\n");
+        sod_len(k, 3, "salt", n3, crypto_pwhash_SALTBYTES, "SODIUM_CRYPTO_PWHASH_SALTBYTES");
+        char m[80];
+        if ((unsigned long long)ops < crypto_pwhash_OPSLIMIT_MIN) {
+            snprintf(m, sizeof m, "must be greater than or equal to %d", (int)crypto_pwhash_OPSLIMIT_MIN);
+            sod_argerr(k, 4, "opslimit", m);
+        }
+        if ((unsigned long long)mem < crypto_pwhash_MEMLIMIT_MIN) {
+            snprintf(m, sizeof m, "must be greater than or equal to %d", (int)crypto_pwhash_MEMLIMIT_MIN);
+            sod_argerr(k, 5, "memlimit", m);
+        }
+        out = sod_buf((size_t)len);
+        struct rlimit saved;
+        sod_lift_limit((size_t)mem, &saved);
+        int rc = crypto_pwhash(out, (unsigned long long)len, (const char*)s2, n2, s3,
+                               (unsigned long long)ops, (size_t)mem, (int)alg);
+        sod_restore_limit(&saved);
+        if (rc != 0) sod_throw("internal error");
+        sod_free(s2, n2); sod_free(s3, n3);
+        return sod_ret(out, (size_t)len);
+    }
+
+    /* ---- stream ciphers ---- */
+
+    if (!strcmp(name, "sodium_crypto_stream") || !strcmp(name, "sodium_crypto_stream_xchacha20")) {
+        int xc = strstr(name, "xchacha20") != 0;
+        sod_argc(k, 3, 3);
+        long long len = sod_int(k, 1, "length", 0);
+        s2 = sod_str(k, 2, "nonce", &n2);
+        s3 = sod_str(k, 3, "key", &n3);
+        if (len <= 0) sod_argerr(k, 1, "length", "must be greater than 0");
+        sod_len(k, 2, "nonce", n2, 24, xc ? "SODIUM_CRYPTO_STREAM_XCHACHA20_NONCEBYTES" : "SODIUM_CRYPTO_STREAM_NONCEBYTES");
+        sod_len(k, 3, "key", n3, 32, xc ? "SODIUM_CRYPTO_STREAM_XCHACHA20_KEYBYTES" : "SODIUM_CRYPTO_STREAM_KEYBYTES");
+        out = sod_buf((size_t)len);
+        if ((xc ? crypto_stream_xchacha20 : crypto_stream)(out, (unsigned long long)len, s2, s3) != 0)
+            sod_throw("internal error");
+        sod_free(s2, n2); sod_free(s3, n3);
+        return sod_ret(out, (size_t)len);
+    }
+
+    if (!strcmp(name, "sodium_crypto_stream_xor") || !strcmp(name, "sodium_crypto_stream_xchacha20_xor") ||
+        !strcmp(name, "sodium_crypto_stream_xchacha20_xor_ic")) {
+        int xc = strstr(name, "xchacha20") != 0, ic = strstr(name, "_ic") != 0;
+        sod_argc(k, ic ? 4 : 3, ic ? 4 : 3);
+        s1 = sod_str(k, 1, "message", &n1);
+        s2 = sod_str(k, 2, "nonce", &n2);
+        long long ctr = ic ? sod_int(k, 3, "counter", 0) : 0;
+        s3 = sod_str(k, ic ? 4 : 3, "key", &n3);
+        sod_len(k, 2, "nonce", n2, 24, xc ? "SODIUM_CRYPTO_STREAM_XCHACHA20_NONCEBYTES" : "SODIUM_CRYPTO_STREAM_NONCEBYTES");
+        /* sic: in _xor_ic PHP reports a bad key as argument #3 ($counter) */
+        sod_len(k, 3, ic ? "counter" : "key", n3, 32,
+                xc ? "SODIUM_CRYPTO_STREAM_XCHACHA20_KEYBYTES" : "SODIUM_CRYPTO_STREAM_KEYBYTES");
+        out = sod_buf(n1);
+        int rc = ic ? crypto_stream_xchacha20_xor_ic(out, s1, n1, s2, (uint64_t)ctr, s3)
+               : xc ? crypto_stream_xchacha20_xor(out, s1, n1, s2, s3)
+                    : crypto_stream_xor(out, s1, n1, s2, s3);
+        if (rc != 0) sod_throw("internal error");
+        sod_free(s1, n1); sod_free(s2, n2); sod_free(s3, n3);
+        return sod_ret(out, n1);
+    }
+
+    /* ---- secretstream: XChaCha20-Poly1305 for long or chunked data ---- */
+
+    if (!strcmp(name, "sodium_crypto_secretstream_xchacha20poly1305_init_push")) {
+        sod_argc(k, 1, 1);
+        s1 = sod_str(k, 1, "key", &n1);
+        sod_len(k, 1, "key", n1, crypto_secretstream_xchacha20poly1305_KEYBYTES,
+                "SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_KEYBYTES");
+        crypto_secretstream_xchacha20poly1305_state st;
+        unsigned char* hdr = sod_buf(crypto_secretstream_xchacha20poly1305_HEADERBYTES);
+        if (crypto_secretstream_xchacha20poly1305_init_push(&st, hdr, s1) != 0) sod_throw("internal error");
+        out = sod_buf(sizeof st);
+        memcpy(out, &st, sizeof st);
+        sodium_memzero(&st, sizeof st);
+        sod_free(s1, n1);
+        return sod_pair(sod_ret(out, sizeof st), sod_ret(hdr, crypto_secretstream_xchacha20poly1305_HEADERBYTES));
+    }
+
+    if (!strcmp(name, "sodium_crypto_secretstream_xchacha20poly1305_init_pull")) {
+        sod_argc(k, 2, 2);
+        s1 = sod_str(k, 1, "header", &n1);
+        s2 = sod_str(k, 2, "key", &n2);
+        sod_len(k, 1, "header", n1, crypto_secretstream_xchacha20poly1305_HEADERBYTES,
+                "SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_HEADERBYTES");
+        sod_len(k, 2, "key", n2, crypto_secretstream_xchacha20poly1305_KEYBYTES,
+                "SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_KEYBYTES");
+        crypto_secretstream_xchacha20poly1305_state st;
+        if (crypto_secretstream_xchacha20poly1305_init_pull(&st, s1, s2) != 0) sod_throw("internal error");
+        out = sod_buf(sizeof st);
+        memcpy(out, &st, sizeof st);
+        sodium_memzero(&st, sizeof st);
+        sod_free(s1, n1); sod_free(s2, n2);
+        return sod_ret(out, sizeof st);
+    }
+
+    if (!strcmp(name, "sodium_crypto_secretstream_xchacha20poly1305_push") ||
+        !strcmp(name, "sodium_crypto_secretstream_xchacha20poly1305_pull") ||
+        !strcmp(name, "sodium_crypto_secretstream_xchacha20poly1305_rekey")) {
+        const char* op = strrchr(name, '_') + 1;
+        int push = !strcmp(op, "push"), rekey = !strcmp(op, "rekey");
+        if (rekey) sod_argc(k, 1, 1); else if (push) sod_argc(k, 2, 4); else sod_argc(k, 2, 3);
+        Value* sv = sod_ref(k, 1);
+        if (!sv || sv->type != T_STRING) sod_argerr(k, 1, "state", "must be a reference to a state");
+        crypto_secretstream_xchacha20poly1305_state st;
+        if (slen(sv) != sizeof st) {
+            if (push) sod_argerr(k, 1, "state", "must have a correct length");
+            sod_throw("incorrect state length");
+        }
+        memcpy(&st, sv->s, sizeof st);
+        if (rekey) {
+            crypto_secretstream_xchacha20poly1305_rekey(&st);
+            sod_set(sv, (unsigned char*)&st, sizeof st);
+            sodium_memzero(&st, sizeof st);
+            return v_null();
+        }
+        s2 = sod_str(k, 2, push ? "message" : "ciphertext", &n2);
+        s3 = sod_str(k, 3, "additional_data", &n3);
+        Value* r;
+        if (push) {
+            long long tag = sod_int(k, 4, "tag", crypto_secretstream_xchacha20poly1305_TAG_MESSAGE);
+            if ((unsigned long long)n2 > crypto_secretstream_xchacha20poly1305_MESSAGEBYTES_MAX)
+                sod_argerr(k, 2, "message", "must be at most SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_MESSAGEBYTES_MAX bytes long");
+            if (tag < 0 || tag > 255) sod_argerr(k, 4, "tag", "must be in the range of 0-255");
+            unsigned long long rl = 0;
+            out = sod_buf(n2 + crypto_secretstream_xchacha20poly1305_ABYTES);
+            if (crypto_secretstream_xchacha20poly1305_push(&st, out, &rl, s2, n2, n3 ? s3 : 0, n3,
+                                                           (unsigned char)tag) != 0)
+                sod_throw("internal error");
+            r = sod_ret(out, (size_t)rl);
+            sod_set(sv, (unsigned char*)&st, sizeof st);
+        } else if (n2 < crypto_secretstream_xchacha20poly1305_ABYTES) {
+            r = v_bool(0);
+        } else {
+            unsigned long long rl = 0;
+            unsigned char tag = 0;
+            out = sod_buf(n2 - crypto_secretstream_xchacha20poly1305_ABYTES);
+            if (crypto_secretstream_xchacha20poly1305_pull(&st, out, &rl, &tag, s2, n2, n3 ? s3 : 0, n3) != 0) {
+                free(out);
+                r = v_bool(0);
+            } else {
+                r = sod_pair(sod_ret(out, (size_t)rl), v_int(tag));
+                sod_set(sv, (unsigned char*)&st, sizeof st);
+            }
+        }
+        sodium_memzero(&st, sizeof st);
+        sod_free(s2, n2); sod_free(s3, n3);
+        return r;
+    }
+
+    /* ---- helpers: encoding, comparison, counters, padding ---- */
+
+    if (!strcmp(name, "sodium_bin2hex")) {
+        sod_argc(k, 1, 1);
+        s1 = sod_str(k, 1, "string", &n1);
+        out = sod_buf(n1 * 2);
+        sodium_bin2hex((char*)out, n1 * 2 + 1, s1, n1);
+        sod_free(s1, n1);
+        return sod_ret(out, n1 * 2);
+    }
+
+    if (!strcmp(name, "sodium_hex2bin")) {
+        sod_argc(k, 1, 2);
+        s1 = sod_str(k, 1, "string", &n1);
+        s2 = sod_str(k, 2, "ignore", &n2);
+        size_t bl = n1 / 2, real = 0;
+        const char* end = 0;
+        out = sod_buf(bl);
+        if (sodium_hex2bin(out, bl, (const char*)s1, n1, n2 ? (const char*)s2 : 0, &real, &end) != 0 ||
+            end != (const char*)s1 + n1)
+            sod_argerr(k, 1, "string", "must be a valid hexadecimal string");
+        sod_free(s1, n1); sod_free(s2, n2);
+        return sod_ret(out, real);
+    }
+
+    if (!strcmp(name, "sodium_bin2base64")) {
+        sod_argc(k, 2, 2);
+        s1 = sod_str(k, 1, "string", &n1);
+        long long var = sod_int(k, 2, "id", 0);
+        if ((((unsigned int)var) & ~0x6U) != 0x1U)
+            sod_argerr(k, 2, "id", "must be a valid base64 variant identifier");
+        size_t el = sodium_base64_ENCODED_LEN(n1, (int)var);
+        out = sod_buf(el - 1);
+        sodium_bin2base64((char*)out, el, s1, n1, (int)var);
+        sod_free(s1, n1);
+        return sod_ret(out, el - 1);
+    }
+
+    if (!strcmp(name, "sodium_base642bin")) {
+        sod_argc(k, 2, 3);
+        s1 = sod_str(k, 1, "string", &n1);
+        long long var = sod_int(k, 2, "id", 0);
+        s3 = sod_str(k, 3, "ignore", &n3);
+        if ((((unsigned int)var) & ~0x6U) != 0x1U)
+            sod_argerr(k, 2, "id", "must be a valid base64 variant identifier");
+        size_t bl = n1 / 4 * 3 + 2, real = 0;
+        const char* end = 0;
+        out = sod_buf(bl);
+        if (sodium_base642bin(out, bl, (const char*)s1, n1, n3 ? (const char*)s3 : 0, &real, &end, (int)var) != 0 ||
+            end != (const char*)s1 + n1)
+            sod_argerr(k, 1, "string", "must be a valid base64 string");
+        sod_free(s1, n1); sod_free(s3, n3);
+        return sod_ret(out, real);
+    }
+
+    if (!strcmp(name, "sodium_memcmp") || !strcmp(name, "sodium_compare")) {
+        sod_argc(k, 2, 2);
+        s1 = sod_str(k, 1, "string1", &n1);
+        s2 = sod_str(k, 2, "string2", &n2);
+        if (n1 != n2) sod_argerr(k, 1, "string1", "and argument #2 ($string_2) must have the same length");
+        int r = name[7] == 'm' ? sodium_memcmp(s1, s2, n1) : sodium_compare(s1, s2, n1);
+        sod_free(s1, n1); sod_free(s2, n2);
+        return v_int(r);
+    }
+
+    if (!strcmp(name, "sodium_memzero")) {
+        sod_argc(k, 1, 1);
+        Value* v = sod_ref(k, 1);
+        if (v->type != T_STRING) sod_throw("a PHP string is required");
+        sod_null(v);          /* bytes wiped, variable becomes null -- as in PHP */
+        return v_null();
+    }
+
+    if (!strcmp(name, "sodium_increment")) {
+        sod_argc(k, 1, 1);
+        Value* v = sod_ref(k, 1);
+        if (v->type != T_STRING) sod_throw("a PHP string is required");
+        size_t n = slen(v);
+        unsigned char* p = (unsigned char*)val_bin(v, &n);
+        sodium_increment(p, n);
+        sod_set(v, p, n);
+        sod_free(p, n);
+        return v_null();
+    }
+
+    if (!strcmp(name, "sodium_add")) {
+        sod_argc(k, 2, 2);
+        Value* v = sod_ref(k, 1);
+        if (v->type != T_STRING) sod_throw("PHP strings are required");
+        s2 = sod_str(k, 2, "string2", &n2);
+        size_t n = slen(v);
+        if (n != n2) sod_argerr(k, 1, "string1", "and argument #2 ($string_2) must have the same length");
+        unsigned char* p = (unsigned char*)val_bin(v, &n);
+        sodium_add(p, s2, n);
+        sod_set(v, p, n);
+        sod_free(p, n); sod_free(s2, n2);
+        return v_null();
+    }
+
+    if (!strcmp(name, "sodium_pad") || !strcmp(name, "sodium_unpad")) {
+        int pad = name[7] == 'p';
+        sod_argc(k, 2, 2);
+        s1 = sod_str(k, 1, "string", &n1);
+        long long bs = sod_int(k, 2, "block_size", 0);
+        if (bs <= 0) sod_argerr(k, 2, "block_size", "must be greater than 0");
+        Value* r;
+        if (pad) {
+            size_t xpad = (size_t)bs - 1U - n1 % (size_t)bs;
+            if (SIZE_MAX - n1 <= xpad) sod_throw("input is too large");
+            size_t total = n1 + xpad + 1U;
+            out = sod_buf(total);
+            memcpy(out, s1, n1);
+            size_t pl = 0;
+            if (sodium_pad(&pl, out, n1, (size_t)bs, total) != 0) sod_throw("internal error");
+            r = sod_ret(out, pl);
+        } else {
+            if (n1 < (size_t)bs) sod_argerr(k, 1, "string", "must be at least as long as the block size");
+            size_t ul = 0;
+            if (sodium_unpad(&ul, s1, n1, (size_t)bs) != 0) sod_throw("invalid padding");
+            out = sod_buf(ul);
+            memcpy(out, s1, ul);
+            r = sod_ret(out, ul);
+        }
+        sod_free(s1, n1);
+        return r;
+    }
+
+    *handled = 0;
+    return 0;
+}
+
+/* SODIUM_* constants, resolved when the script is parsed. Values are
+   libsodium's own; the names are PHP's. */
+static const struct { const char* name; long long i; const char* s; } sod_consts[] = {
+    { "SODIUM_LIBRARY_VERSION", 0, SODIUM_VERSION_STRING },
+    { "SODIUM_LIBRARY_MAJOR_VERSION", SODIUM_LIBRARY_VERSION_MAJOR, 0 },
+    { "SODIUM_LIBRARY_MINOR_VERSION", SODIUM_LIBRARY_VERSION_MINOR, 0 },
+    { "SODIUM_CRYPTO_AEAD_AES256GCM_KEYBYTES", crypto_aead_aes256gcm_KEYBYTES, 0 },
+    { "SODIUM_CRYPTO_AEAD_AES256GCM_NSECBYTES", crypto_aead_aes256gcm_NSECBYTES, 0 },
+    { "SODIUM_CRYPTO_AEAD_AES256GCM_NPUBBYTES", crypto_aead_aes256gcm_NPUBBYTES, 0 },
+    { "SODIUM_CRYPTO_AEAD_AES256GCM_ABYTES", crypto_aead_aes256gcm_ABYTES, 0 },
+    { "SODIUM_CRYPTO_AEAD_CHACHA20POLY1305_KEYBYTES", crypto_aead_chacha20poly1305_KEYBYTES, 0 },
+    { "SODIUM_CRYPTO_AEAD_CHACHA20POLY1305_NSECBYTES", crypto_aead_chacha20poly1305_NSECBYTES, 0 },
+    { "SODIUM_CRYPTO_AEAD_CHACHA20POLY1305_NPUBBYTES", crypto_aead_chacha20poly1305_NPUBBYTES, 0 },
+    { "SODIUM_CRYPTO_AEAD_CHACHA20POLY1305_ABYTES", crypto_aead_chacha20poly1305_ABYTES, 0 },
+    { "SODIUM_CRYPTO_AEAD_CHACHA20POLY1305_IETF_KEYBYTES", crypto_aead_chacha20poly1305_ietf_KEYBYTES, 0 },
+    { "SODIUM_CRYPTO_AEAD_CHACHA20POLY1305_IETF_NSECBYTES", crypto_aead_chacha20poly1305_ietf_NSECBYTES, 0 },
+    { "SODIUM_CRYPTO_AEAD_CHACHA20POLY1305_IETF_NPUBBYTES", crypto_aead_chacha20poly1305_ietf_NPUBBYTES, 0 },
+    { "SODIUM_CRYPTO_AEAD_CHACHA20POLY1305_IETF_ABYTES", crypto_aead_chacha20poly1305_ietf_ABYTES, 0 },
+    { "SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_KEYBYTES", crypto_aead_xchacha20poly1305_ietf_KEYBYTES, 0 },
+    { "SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NSECBYTES", crypto_aead_xchacha20poly1305_ietf_NSECBYTES, 0 },
+    { "SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NPUBBYTES", crypto_aead_xchacha20poly1305_ietf_NPUBBYTES, 0 },
+    { "SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_ABYTES", crypto_aead_xchacha20poly1305_ietf_ABYTES, 0 },
+    { "SODIUM_CRYPTO_AUTH_BYTES", crypto_auth_BYTES, 0 },
+    { "SODIUM_CRYPTO_AUTH_KEYBYTES", crypto_auth_KEYBYTES, 0 },
+    { "SODIUM_CRYPTO_BOX_SEALBYTES", crypto_box_SEALBYTES, 0 },
+    { "SODIUM_CRYPTO_BOX_SECRETKEYBYTES", crypto_box_SECRETKEYBYTES, 0 },
+    { "SODIUM_CRYPTO_BOX_PUBLICKEYBYTES", crypto_box_PUBLICKEYBYTES, 0 },
+    { "SODIUM_CRYPTO_BOX_KEYPAIRBYTES", crypto_box_SECRETKEYBYTES + crypto_box_PUBLICKEYBYTES, 0 },
+    { "SODIUM_CRYPTO_BOX_MACBYTES", crypto_box_MACBYTES, 0 },
+    { "SODIUM_CRYPTO_BOX_NONCEBYTES", crypto_box_NONCEBYTES, 0 },
+    { "SODIUM_CRYPTO_BOX_SEEDBYTES", crypto_box_SEEDBYTES, 0 },
+    { "SODIUM_CRYPTO_KDF_BYTES_MIN", crypto_kdf_BYTES_MIN, 0 },
+    { "SODIUM_CRYPTO_KDF_BYTES_MAX", crypto_kdf_BYTES_MAX, 0 },
+    { "SODIUM_CRYPTO_KDF_CONTEXTBYTES", crypto_kdf_CONTEXTBYTES, 0 },
+    { "SODIUM_CRYPTO_KDF_KEYBYTES", crypto_kdf_KEYBYTES, 0 },
+    { "SODIUM_CRYPTO_KX_SEEDBYTES", crypto_kx_SEEDBYTES, 0 },
+    { "SODIUM_CRYPTO_KX_SESSIONKEYBYTES", crypto_kx_SESSIONKEYBYTES, 0 },
+    { "SODIUM_CRYPTO_KX_PUBLICKEYBYTES", crypto_kx_PUBLICKEYBYTES, 0 },
+    { "SODIUM_CRYPTO_KX_SECRETKEYBYTES", crypto_kx_SECRETKEYBYTES, 0 },
+    { "SODIUM_CRYPTO_KX_KEYPAIRBYTES", crypto_kx_SECRETKEYBYTES + crypto_kx_PUBLICKEYBYTES, 0 },
+    { "SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_ABYTES", crypto_secretstream_xchacha20poly1305_ABYTES, 0 },
+    { "SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_HEADERBYTES", crypto_secretstream_xchacha20poly1305_HEADERBYTES, 0 },
+    { "SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_KEYBYTES", crypto_secretstream_xchacha20poly1305_KEYBYTES, 0 },
+    { "SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_MESSAGEBYTES_MAX",
+      (long long)crypto_secretstream_xchacha20poly1305_MESSAGEBYTES_MAX, 0 },
+    { "SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_TAG_MESSAGE", crypto_secretstream_xchacha20poly1305_TAG_MESSAGE, 0 },
+    { "SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_TAG_PUSH", crypto_secretstream_xchacha20poly1305_TAG_PUSH, 0 },
+    { "SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_TAG_REKEY", crypto_secretstream_xchacha20poly1305_TAG_REKEY, 0 },
+    { "SODIUM_CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_TAG_FINAL", crypto_secretstream_xchacha20poly1305_TAG_FINAL, 0 },
+    { "SODIUM_CRYPTO_GENERICHASH_BYTES", crypto_generichash_BYTES, 0 },
+    { "SODIUM_CRYPTO_GENERICHASH_BYTES_MIN", crypto_generichash_BYTES_MIN, 0 },
+    { "SODIUM_CRYPTO_GENERICHASH_BYTES_MAX", crypto_generichash_BYTES_MAX, 0 },
+    { "SODIUM_CRYPTO_GENERICHASH_KEYBYTES", crypto_generichash_KEYBYTES, 0 },
+    { "SODIUM_CRYPTO_GENERICHASH_KEYBYTES_MIN", crypto_generichash_KEYBYTES_MIN, 0 },
+    { "SODIUM_CRYPTO_GENERICHASH_KEYBYTES_MAX", crypto_generichash_KEYBYTES_MAX, 0 },
+    { "SODIUM_CRYPTO_PWHASH_ALG_ARGON2I13", crypto_pwhash_ALG_ARGON2I13, 0 },
+    { "SODIUM_CRYPTO_PWHASH_ALG_ARGON2ID13", crypto_pwhash_ALG_ARGON2ID13, 0 },
+    { "SODIUM_CRYPTO_PWHASH_ALG_DEFAULT", crypto_pwhash_ALG_DEFAULT, 0 },
+    { "SODIUM_CRYPTO_PWHASH_SALTBYTES", crypto_pwhash_SALTBYTES, 0 },
+    { "SODIUM_CRYPTO_PWHASH_STRPREFIX", 0, crypto_pwhash_STRPREFIX },
+    { "SODIUM_CRYPTO_PWHASH_OPSLIMIT_INTERACTIVE", crypto_pwhash_OPSLIMIT_INTERACTIVE, 0 },
+    { "SODIUM_CRYPTO_PWHASH_MEMLIMIT_INTERACTIVE", crypto_pwhash_MEMLIMIT_INTERACTIVE, 0 },
+    { "SODIUM_CRYPTO_PWHASH_OPSLIMIT_MODERATE", crypto_pwhash_OPSLIMIT_MODERATE, 0 },
+    { "SODIUM_CRYPTO_PWHASH_MEMLIMIT_MODERATE", crypto_pwhash_MEMLIMIT_MODERATE, 0 },
+    { "SODIUM_CRYPTO_PWHASH_OPSLIMIT_SENSITIVE", crypto_pwhash_OPSLIMIT_SENSITIVE, 0 },
+    { "SODIUM_CRYPTO_PWHASH_MEMLIMIT_SENSITIVE", crypto_pwhash_MEMLIMIT_SENSITIVE, 0 },
+    { "SODIUM_CRYPTO_SCALARMULT_BYTES", crypto_scalarmult_BYTES, 0 },
+    { "SODIUM_CRYPTO_SCALARMULT_SCALARBYTES", crypto_scalarmult_SCALARBYTES, 0 },
+    { "SODIUM_CRYPTO_SHORTHASH_BYTES", crypto_shorthash_BYTES, 0 },
+    { "SODIUM_CRYPTO_SHORTHASH_KEYBYTES", crypto_shorthash_KEYBYTES, 0 },
+    { "SODIUM_CRYPTO_SECRETBOX_KEYBYTES", crypto_secretbox_KEYBYTES, 0 },
+    { "SODIUM_CRYPTO_SECRETBOX_MACBYTES", crypto_secretbox_MACBYTES, 0 },
+    { "SODIUM_CRYPTO_SECRETBOX_NONCEBYTES", crypto_secretbox_NONCEBYTES, 0 },
+    { "SODIUM_CRYPTO_SIGN_BYTES", crypto_sign_BYTES, 0 },
+    { "SODIUM_CRYPTO_SIGN_SEEDBYTES", crypto_sign_SEEDBYTES, 0 },
+    { "SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES", crypto_sign_PUBLICKEYBYTES, 0 },
+    { "SODIUM_CRYPTO_SIGN_SECRETKEYBYTES", crypto_sign_SECRETKEYBYTES, 0 },
+    { "SODIUM_CRYPTO_SIGN_KEYPAIRBYTES", crypto_sign_SECRETKEYBYTES + crypto_sign_PUBLICKEYBYTES, 0 },
+    { "SODIUM_CRYPTO_STREAM_NONCEBYTES", crypto_stream_NONCEBYTES, 0 },
+    { "SODIUM_CRYPTO_STREAM_KEYBYTES", crypto_stream_KEYBYTES, 0 },
+    { "SODIUM_CRYPTO_STREAM_XCHACHA20_NONCEBYTES", crypto_stream_xchacha20_NONCEBYTES, 0 },
+    { "SODIUM_CRYPTO_STREAM_XCHACHA20_KEYBYTES", crypto_stream_xchacha20_KEYBYTES, 0 },
+    { "SODIUM_BASE64_VARIANT_ORIGINAL", sodium_base64_VARIANT_ORIGINAL, 0 },
+    { "SODIUM_BASE64_VARIANT_ORIGINAL_NO_PADDING", sodium_base64_VARIANT_ORIGINAL_NO_PADDING, 0 },
+    { "SODIUM_BASE64_VARIANT_URLSAFE", sodium_base64_VARIANT_URLSAFE, 0 },
+    { "SODIUM_BASE64_VARIANT_URLSAFE_NO_PADDING", sodium_base64_VARIANT_URLSAFE_NO_PADDING, 0 },
+};
+
+/* 1 and the node filled in if name is a SODIUM_* constant */
+static int sodium_constant(const char* name, Node* n) {
+    if (strncmp(name, "SODIUM_", 7)) return 0;
+    for (size_t i = 0; i < sizeof sod_consts / sizeof sod_consts[0]; i++) {
+        if (strcmp(name, sod_consts[i].name)) continue;
+        if (sod_consts[i].s) { n->type = NT_STR; n->s = xstrdup(sod_consts[i].s); }
+        else { n->type = NT_INT; n->i = sod_consts[i].i; }
+        return 1;
+    }
+    return 0;
+}
+#endif /* MINIPHP_SODIUM */
+
 static Value* builtin(const char* name, Value** args, int argc) {
 #ifndef MINIPHP_NO_SQLITE
     if (!strncmp(name, "sqlite_", 7)) {
         int handled = 0;
         Value* r = sqlite_builtin(name, args, argc, &handled);
+        if (handled) return r;
+    }
+#endif
+#ifdef MINIPHP_SODIUM
+    if (!strncmp(name, "sodium_", 7)) {
+        int handled = 0;
+        Value* r = sodium_builtin(name, args, argc, &handled);
         if (handled) return r;
     }
 #endif
@@ -4313,6 +5420,29 @@ static Value* builtin(const char* name, Value** args, int argc) {
         long long r = n ? (unsigned char)p[0] : 0;
         free(p);
         return v_int(r);
+    }
+
+    if (!strcmp(name, "random_bytes")) {
+        NEED(1);
+        long long n = val_to_int(args[0]);
+        if (n < 1) fatal("Uncaught ValueError: random_bytes(): Argument #1 ($length) must be greater than 0");
+        char* out = malloc((size_t)n + 1);
+#ifdef MINIPHP_SODIUM
+        randombytes_buf(out, (size_t)n);
+#else
+        /* the kernel's CSPRNG, as PHP uses; never a fallback to rand() */
+        int fd = open("/dev/urandom", O_RDONLY);
+        size_t got = 0;
+        while (fd >= 0 && got < (size_t)n) {
+            ssize_t r = read(fd, out + got, (size_t)n - got);
+            if (r <= 0) break;
+            got += (size_t)r;
+        }
+        if (fd >= 0) close(fd);
+        if (got < (size_t)n) fatal("Uncaught Random\\RandomException: Cannot open source device");
+#endif
+        out[n] = 0;
+        return v_str_own(out, (size_t)n);
     }
 
     if (!strcmp(name, "bin2hex")) {
@@ -5507,6 +6637,9 @@ static void exec(Node* n, Env* env) {
 
 int main(int argc, char** argv) {
     stack_guard_init(__builtin_frame_address(0));
+#ifdef MINIPHP_SODIUM
+    if (sodium_init() < 0) fatal("libsodium could not be initialised");
+#endif
 
     FILE* f = stdin;
     int close_f = 0;

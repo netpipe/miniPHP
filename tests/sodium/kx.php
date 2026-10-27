@@ -1,0 +1,2 @@
+<?php
+$c = sodium_crypto_kx_seed_keypair(str_repeat("c", 32)); $s = sodium_crypto_kx_seed_keypair(str_repeat("s", 32)); echo bin2hex($c), " ", bin2hex(sodium_crypto_kx_secretkey($s)), bin2hex(sodium_crypto_kx_publickey($s)), " "; $ck = sodium_crypto_kx_client_session_keys($c, sodium_crypto_kx_publickey($s)); $sk = sodium_crypto_kx_server_session_keys($s, sodium_crypto_kx_publickey($c)); echo bin2hex($ck[0]), bin2hex($ck[1]), " ", $ck[0] === $sk[1] && $ck[1] === $sk[0] ? "agree" : "DISAGREE", count($ck);
