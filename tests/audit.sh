@@ -10,12 +10,14 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 W=$(mktemp -d)
+# SQLite is compiled once by make and reused (it is ~270,000 lines)
 trap 'rm -rf "$W"' EXIT
+make -s -C "$ROOT" sqlite/sqlite3.o || { echo "could not build sqlite/sqlite3.o"; exit 1; }
 BIN="$W/php"
 export ASAN_OPTIONS=detect_leaks=0
 
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined \
-    -fno-omit-frame-pointer -o "$BIN" "$ROOT/main.c" -lm || { echo "BUILD FAILED"; exit 1; }
+    -fno-omit-frame-pointer -o "$BIN" "$ROOT/main.c" "$ROOT/sqlite/sqlite3.o" -lm || { echo "BUILD FAILED"; exit 1; }
 
 pass=0; fail=0
 ok()   { pass=$((pass + 1)); printf '  ok    %s\n' "$1"; }
@@ -76,7 +78,7 @@ expect "endless loop under CGI stops at max_execution_time" "$out" 'Maximum exec
 # Memory: built WITHOUT sanitizers on purpose. ASan's own internal mappings
 # count against the same kernel limit and it stops with its own message first;
 # the shipped binary is a plain build, and that is what has to say it.
-gcc -std=c11 -O2 -o "$W/plain" "$ROOT/main.c" -lm
+gcc -std=c11 -O2 -o "$W/plain" "$ROOT/main.c" "$ROOT/sqlite/sqlite3.o" -lm
 printf '<?php $i = 0; while (1) { $s = "x" . $i; $i = $i + 1; }' > "$W/t.php"
 out=$(env REQUEST_METHOD=GET GATEWAY_INTERFACE=CGI/1.1 PHPMINI_MEMORY_LIMIT=32M timeout 20 "$W/plain" "$W/t.php" 2>&1)
 expect "a memory-hungry loop under CGI stops at memory_limit" "$out" 'Allowed memory size of 33554432 bytes exhausted'
@@ -169,6 +171,49 @@ big=$W/big; : > "$big"
 out=$(printf '<?php echo count($_POST), count($_FILES);' > "$W/t.php"; env REQUEST_METHOD=POST GATEWAY_INTERFACE=CGI/1.1 \
       CONTENT_TYPE="multipart/form-data; boundary=$B" CONTENT_LENGTH=104857600 timeout 10 "$BIN" "$W/t.php" < "$big" 2>&1 | tr -d '\r')
 expect "a body over post_max_size is not read (100 MB claimed, 8 MB limit)" "$out" 'exceeds the limit'
+
+echo "-- SQLite (milestone 5) --"
+q() { printf '<?php %s' "$1" > "$W/t.php"; (cd "$W" && timeout 30 "$BIN" t.php 2>&1); }
+
+expect "\$name parameters bind (SQLite supports them; PHP's SQLite3 class does not)" \
+  "$(q '$d = sqlite_open(":memory:"); $r = sqlite_query($d, "SELECT $v + 1 AS x", ["v" => 41]); echo $r[0]["x"];')" '^42$'
+
+out=$(q '$d = sqlite_open(":memory:"); sqlite_exec($d, "CREATE TABLE t (x)"); var_dump(sqlite_query($d, "SELECT 1; DROP TABLE t")); echo "tables=", count(sqlite_query($d, "SELECT name FROM sqlite_master WHERE name = ?", ["t"]));' | tr '\n' ' ')
+expect "a second statement smuggled into sqlite_query() is refused, table survives" "$out" 'only one statement.*bool\(false\).*tables=1'
+
+expect "sqlite_exec() without parameters runs a whole multi-statement script" \
+  "$(q '$d = sqlite_open(":memory:"); sqlite_exec($d, "CREATE TABLE a (x); CREATE TABLE b (y); INSERT INTO a VALUES (1); INSERT INTO b VALUES (2);"); echo count(sqlite_query($d, "SELECT * FROM a")), count(sqlite_query($d, "SELECT * FROM b"));')" '^11$'
+
+expect "load_extension() does not exist (no native code from SQL)" \
+  "$(q '$d = sqlite_open(":memory:"); var_dump(sqlite_query($d, "SELECT load_extension(?)", ["/tmp/x.so"])); echo sqlite_error($d);')" 'no such function: load_extension'
+
+expect "defensive mode: SQL cannot rewrite the schema table" \
+  "$(q '$d = sqlite_open(":memory:"); sqlite_exec($d, "CREATE TABLE t (x)"); sqlite_exec($d, "PRAGMA writable_schema = ON"); var_dump(sqlite_exec($d, "UPDATE sqlite_master SET sql = ? WHERE name = ?", ["junk", "t"]));')" 'bool\(false\)'
+
+out=$(q '$d = sqlite_open("p.db"); sqlite_exec($d, "CREATE TABLE IF NOT EXISTS k (v)"); sqlite_exec($d, "INSERT INTO k VALUES (?)", ["first request"]);' ; \
+      q '$d = sqlite_open("p.db"); $r = sqlite_query($d, "SELECT v FROM k"); echo $r[0]["v"];')
+expect "a file database persists to the next request" "$out" 'first request$'
+
+# another process holds the write lock for 2 s; the busy timeout (5 s) waits it out
+if command -v python3 >/dev/null; then
+    (cd "$W" && python3 -c '
+import sqlite3, time
+c = sqlite3.connect("lock.db", isolation_level=None)
+c.execute("CREATE TABLE IF NOT EXISTS t (x)"); c.execute("BEGIN IMMEDIATE"); c.execute("INSERT INTO t VALUES (1)")
+time.sleep(2); c.execute("COMMIT")' &)
+    sleep 0.5
+    out=$(q '$d = sqlite_open("lock.db"); var_dump(sqlite_exec($d, "INSERT INTO t VALUES (?)", [2]));')
+    wait
+    expect "a write waits for another process's lock instead of failing" "$out" 'int\(1\)'
+fi
+
+printf '<?php $d = sqlite_open(":memory:"); $r = sqlite_query($d, "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c LIMIT 20000000) SELECT i, ? AS pad FROM c", [str_repeat("x", 50)]); echo count($r);' > "$W/t.php"
+out=$(env REQUEST_METHOD=GET GATEWAY_INTERFACE=CGI/1.1 PHPMINI_MEMORY_LIMIT=64M timeout 60 "$W/plain" "$W/t.php" 2>&1)
+expect "a 20-million-row result hits memory_limit cleanly, no crash" "$out" 'Allowed memory size'
+
+out=$( (cd "$W" && cp "$ROOT/main.c" . && gcc -std=c11 -DMINIPHP_NO_SQLITE -o nosq main.c -lm 2>&1 && printf '<?php echo strlen("ok"); sqlite_open(":memory:");' > n.php && ./nosq n.php 2>&1) )
+out=$(printf '%s' "$out" | tr '\n' ' ')
+case "$out" in *"Undefined function sqlite_open"*) case "$out" in *2*) ok "built without SQLite (make nosqlite): still works, sqlite_* undefined";; *) bad "built without SQLite" "$out";; esac;; *) bad "built without SQLite (make nosqlite): still works, sqlite_* undefined" "$out";; esac
 
 echo
 echo "$pass passed, $fail failed"

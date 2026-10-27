@@ -1,0 +1,1 @@
+<?php $db = sqlite_open(":memory:"); sqlite_exec($db, "CREATE VIRTUAL TABLE d USING fts5(body)"); sqlite_exec($db, "INSERT INTO d VALUES (?)", ["the quick brown fox"]); sqlite_exec($db, "INSERT INTO d VALUES (?)", ["lazy dogs sleep"]); var_dump(sqlite_query($db, "SELECT body FROM d WHERE d MATCH ?", ["quick"]));

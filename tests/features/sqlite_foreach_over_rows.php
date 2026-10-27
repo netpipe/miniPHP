@@ -1,0 +1,1 @@
+<?php $db = sqlite_open(":memory:"); sqlite_exec($db, "CREATE TABLE p (n TEXT, q INT); INSERT INTO p VALUES ('a', 1), ('b', 2), ('c', 3);"); $t = 0; foreach (sqlite_query($db, "SELECT * FROM p ORDER BY n") as $row) { echo $row["n"], "=", $row["q"], " "; $t += $row["q"]; } echo "total ", $t;

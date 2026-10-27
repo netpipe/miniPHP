@@ -10,7 +10,9 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
-gcc -std=c11 -O1 -g -fsanitize=address,undefined -o "$W/php" "$ROOT/main.c" -lm || { echo "BUILD FAILED"; exit 1; }
+# SQLite is compiled once by make and reused (it is ~270,000 lines)
+make -s -C "$ROOT" sqlite/sqlite3.o || { echo "could not build sqlite/sqlite3.o"; exit 1; }
+gcc -std=c11 -O1 -g -fsanitize=address,undefined -o "$W/php" "$ROOT/main.c" "$ROOT/sqlite/sqlite3.o" -lm || { echo "BUILD FAILED"; exit 1; }
 export ASAN_OPTIONS=detect_leaks=0
 pass=0; fail=0
 for t in "$ROOT"/tests/features/*.php; do

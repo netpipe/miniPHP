@@ -1,0 +1,1 @@
+<?php $db = sqlite_open(":memory:"); sqlite_exec($db, "CREATE TABLE t (x)"); var_dump(sqlite_query($db, "SELECT * FROM t")); sqlite_exec($db, "INSERT INTO t VALUES (?)", [null]); sqlite_exec($db, "INSERT INTO t VALUES (?)", [""]); var_dump(sqlite_query($db, "SELECT x, x IS NULL AS isnull, length(x) AS len FROM t"));

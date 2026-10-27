@@ -1,0 +1,11 @@
+array(1) {
+  [0]=>
+  array(3) {
+    ["s"]=>
+    string(20) "héllo wörld 日本"
+    ["chars"]=>
+    int(2)
+    ["up"]=>
+    string(3) "ABC"
+  }
+}

@@ -1,0 +1,15 @@
+array(1) {
+  [0]=>
+  array(5) {
+    ["i"]=>
+    int(42)
+    ["r"]=>
+    float(2.5)
+    ["s"]=>
+    string(2) "hi"
+    ["n"]=>
+    NULL
+    ["b"]=>
+    string(3) "raw"
+  }
+}

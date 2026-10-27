@@ -17,6 +17,9 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <fcntl.h>
+#ifndef MINIPHP_NO_SQLITE
+#include "sqlite/sqlite3.h"
+#endif
 
 enum {
     T_NULL, T_INT, T_FLOAT, T_BOOL, T_STRING, T_ARRAY
@@ -3689,7 +3692,266 @@ static char* str_replace_all(const char* in, Value* search, Value* repl) {
     return cur;
 }
 
+#ifndef MINIPHP_NO_SQLITE
+/* ---------- SQLite (milestone 5) ----------
+   miniPHP has no objects, so this is not PDO or the SQLite3 class: it is a
+   small set of functions over the same library.
+
+     $db   = sqlite_open("app.db");
+     $rows = sqlite_query($db, "SELECT * FROM users WHERE id = ?", [$id]);
+     $n    = sqlite_exec($db, "UPDATE users SET name = :n WHERE id = :id",
+                         ["n" => $name, "id" => $id]);
+
+   Values go in through BOUND parameters (? or :name), never by pasting them
+   into the SQL text, so SQL injection is closed by default. Rows come back
+   as arrays keyed by column name, with SQLite's own types: INTEGER -> int,
+   REAL -> float, TEXT/BLOB -> string, NULL -> null -- the same mapping as
+   PHP's SQLite3::fetchArray(SQLITE3_ASSOC). Any failure returns false,
+   warns, and leaves the message for sqlite_error(). */
+
+#define MAX_SQLITE_HANDLES 64
+static sqlite3* sq_db[MAX_SQLITE_HANDLES];
+static int sq_count = 0;                 /* handles are never reused in a request */
+
+static void sqlite_close_all(void) {
+    for (int i = 0; i < sq_count; i++)
+        if (sq_db[i]) { sqlite3_close_v2(sq_db[i]); sq_db[i] = 0; }
+}
+
+static sqlite3* sq_handle(Value* v, const char* fn) {
+    long long h = v ? val_to_int(v) : 0;
+    if (h < 1 || h > sq_count || !sq_db[h - 1]) {
+        fprintf(stderr, "PHP warning: %s(): not an open SQLite handle\n", fn);
+        return 0;
+    }
+    return sq_db[h - 1];
+}
+
+/* Bind an array of parameters: a plain list binds ?1, ?2 ... in order; string
+   keys bind by name, with or without the leading ":" / "@" / "$". The count
+   must match the statement -- a missing value is a bug in the calling code,
+   not something to fill in with NULL behind its back. */
+static int sq_bind(sqlite3* db, sqlite3_stmt* st, Value* params, const char* fn) {
+    int want = sqlite3_bind_parameter_count(st);
+    int given = (params && params->type == T_ARRAY) ? array_count(params) : 0;
+    if (given != want) {
+        fprintf(stderr, "PHP warning: %s(): the statement has %d parameter(s), %d given\n", fn, want, given);
+        return 0;
+    }
+    if (!given) return 1;
+
+    int pos = 0;
+    for (ArrayItem* it = params->items; it; it = it->next) {
+        int idx;
+        if (it->key->type == T_INT) {
+            idx = ++pos;
+        } else {
+            const char* k = it->key->s ? it->key->s : "";
+            idx = 0;
+            if (k[0] == ':' || k[0] == '@' || k[0] == '$') idx = sqlite3_bind_parameter_index(st, k);
+            else {
+                char nm[512];
+                const char* pre = ":@$";
+                for (int p = 0; p < 3 && !idx; p++) {
+                    snprintf(nm, sizeof nm, "%c%s", pre[p], k);
+                    idx = sqlite3_bind_parameter_index(st, nm);
+                }
+            }
+            if (!idx) {
+                fprintf(stderr, "PHP warning: %s(): the statement has no parameter named \"%s\"\n", fn, k);
+                return 0;
+            }
+        }
+
+        Value* v = it->val;
+        int rc;
+        if (!v || v->type == T_NULL)  rc = sqlite3_bind_null(st, idx);
+        else if (v->type == T_INT)    rc = sqlite3_bind_int64(st, idx, v->i);
+        else if (v->type == T_BOOL)   rc = sqlite3_bind_int64(st, idx, v->b ? 1 : 0);
+        else if (v->type == T_FLOAT)  rc = sqlite3_bind_double(st, idx, v->d);
+        else if (v->type == T_STRING) rc = sqlite3_bind_text(st, idx, v->s ? v->s : "", -1, SQLITE_TRANSIENT);
+        else {
+            fprintf(stderr, "PHP warning: %s(): an array cannot be bound as a parameter\n", fn);
+            return 0;
+        }
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "PHP warning: %s(): %s\n", fn, sqlite3_errmsg(db));
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Prepare exactly ONE statement. Text after it (other than whitespace and
+   comments) is refused rather than silently ignored: "SELECT ...; DROP ..."
+   either runs both or neither, and quietly running half of what was asked
+   is the worse of the two. sqlite_exec() without parameters is the place
+   for a multi-statement script. */
+static sqlite3_stmt* sq_prepare(sqlite3* db, const char* sql, const char* fn) {
+    sqlite3_stmt* st = 0;
+    const char* tail = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, &tail) != SQLITE_OK) {
+        fprintf(stderr, "PHP warning: %s(): Unable to prepare statement: %s\n", fn, sqlite3_errmsg(db));
+        return 0;
+    }
+    if (!st) {
+        fprintf(stderr, "PHP warning: %s(): the SQL is empty\n", fn);
+        return 0;
+    }
+    if (tail && *tail) {
+        sqlite3_stmt* more = 0;
+        const char* t2 = 0;
+        if (sqlite3_prepare_v2(db, tail, -1, &more, &t2) == SQLITE_OK && more) {
+            sqlite3_finalize(more);
+            sqlite3_finalize(st);
+            fprintf(stderr, "PHP warning: %s(): only one statement is allowed here; "
+                            "use sqlite_exec() without parameters for a script\n", fn);
+            return 0;
+        }
+        if (more) sqlite3_finalize(more);
+    }
+    return st;
+}
+
+static Value* sq_column(sqlite3_stmt* st, int c) {
+    switch (sqlite3_column_type(st, c)) {
+        case SQLITE_INTEGER: return v_int(sqlite3_column_int64(st, c));
+        case SQLITE_FLOAT:   return v_float(sqlite3_column_double(st, c));
+        case SQLITE_NULL:    return v_null();
+        default: {
+            const void* p = sqlite3_column_blob(st, c);
+            int n = sqlite3_column_bytes(st, c);
+            return v_str_n(p ? (const char*)p : "", (size_t)(n > 0 ? n : 0));
+        }
+    }
+}
+
+static Value* sqlite_builtin(const char* name, Value** args, int argc, int* handled) {
+    *handled = 1;
+#define SQNEED(n) do { if (argc < (n)) fatal("%s expects at least %d argument(s)", name, n); } while (0)
+
+    if (!strcmp(name, "sqlite_open")) {
+        SQNEED(1);
+        if (sq_count >= MAX_SQLITE_HANDLES) {
+            fprintf(stderr, "PHP warning: sqlite_open(): too many databases opened in one request\n");
+            return v_bool(0);
+        }
+        char* path = val_to_string(args[0]);
+        sqlite3* db = 0;
+        int rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, 0);
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "PHP warning: sqlite_open(%s): %s\n", path, db ? sqlite3_errmsg(db) : sqlite3_errstr(rc));
+            if (db) sqlite3_close_v2(db);
+            free(path);
+            return v_bool(0);
+        }
+        free(path);
+        /* Several web requests can write at once: wait up to 5 s for a lock
+           instead of failing at once with "database is locked". */
+        sqlite3_busy_timeout(db, 5000);
+        /* SQL cannot corrupt the database file itself (writable_schema and
+           friends are refused) -- harmless for normal use. */
+        sqlite3_db_config(db, SQLITE_DBCONFIG_DEFENSIVE, 1, (int*)0);
+        if (!sq_count) atexit(sqlite_close_all);
+        sq_db[sq_count++] = db;
+        return v_int(sq_count);
+    }
+
+    if (!strcmp(name, "sqlite_close")) {
+        SQNEED(1);
+        sqlite3* db = sq_handle(args[0], name);
+        if (!db) return v_bool(0);
+        sqlite3_close_v2(db);
+        sq_db[val_to_int(args[0]) - 1] = 0;
+        return v_bool(1);
+    }
+
+    if (!strcmp(name, "sqlite_query") || !strcmp(name, "sqlite_exec")) {
+        SQNEED(2);
+        int is_query = name[7] == 'q';
+        sqlite3* db = sq_handle(args[0], name);
+        if (!db) return v_bool(0);
+        char* sql = val_to_string(args[1]);
+        Value* params = argc > 2 ? args[2] : 0;
+        if (params && params->type != T_ARRAY && params->type != T_NULL) {
+            fprintf(stderr, "PHP warning: %s(): parameters must be an array\n", name);
+            free(sql);
+            return v_bool(0);
+        }
+
+        /* sqlite_exec with no parameters: a whole script, several statements */
+        if (!is_query && (!params || params->type == T_NULL || !array_count(params))) {
+            char* err = 0;
+            int rc = sqlite3_exec(db, sql, 0, 0, &err);
+            free(sql);
+            if (rc != SQLITE_OK) {
+                fprintf(stderr, "PHP warning: sqlite_exec(): %s\n", err ? err : sqlite3_errmsg(db));
+                sqlite3_free(err);
+                return v_bool(0);
+            }
+            return v_int(sqlite3_changes(db));
+        }
+
+        sqlite3_stmt* st = sq_prepare(db, sql, name);
+        free(sql);
+        if (!st) return v_bool(0);
+        if (!sq_bind(db, st, params, name)) { sqlite3_finalize(st); return v_bool(0); }
+
+        ArrBuild rows;
+        ab_init(&rows);
+        int cols = sqlite3_column_count(st);
+        int rc;
+        while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+            if (!is_query) continue;
+            Value* row = v_new(T_ARRAY);
+            for (int c = 0; c < cols; c++) {
+                const char* cn = sqlite3_column_name(st, c);
+                /* a repeated column name keeps the LAST value, as PHP does */
+                array_put(row, normalize_key(v_str(cn ? cn : "")), sq_column(st, c));
+            }
+            ab_push(&rows, row);
+        }
+        if (rc != SQLITE_DONE) {
+            fprintf(stderr, "PHP warning: %s(): %s\n", name, sqlite3_errmsg(db));
+            sqlite3_finalize(st);
+            return v_bool(0);
+        }
+        sqlite3_finalize(st);
+        return is_query ? rows.arr : v_int(sqlite3_changes(db));
+    }
+
+    if (!strcmp(name, "sqlite_last_insert_id")) {
+        SQNEED(1);
+        sqlite3* db = sq_handle(args[0], name);
+        return db ? v_int(sqlite3_last_insert_rowid(db)) : v_bool(0);
+    }
+
+    if (!strcmp(name, "sqlite_changes")) {
+        SQNEED(1);
+        sqlite3* db = sq_handle(args[0], name);
+        return db ? v_int(sqlite3_changes(db)) : v_bool(0);
+    }
+
+    if (!strcmp(name, "sqlite_error")) {
+        SQNEED(1);
+        sqlite3* db = sq_handle(args[0], name);
+        return v_str(db ? sqlite3_errmsg(db) : "not an open SQLite handle");
+    }
+
+#undef SQNEED
+    *handled = 0;
+    return 0;
+}
+#endif
+
 static Value* builtin(const char* name, Value** args, int argc) {
+#ifndef MINIPHP_NO_SQLITE
+    if (!strncmp(name, "sqlite_", 7)) {
+        int handled = 0;
+        Value* r = sqlite_builtin(name, args, argc, &handled);
+        if (handled) return r;
+    }
+#endif
 #define NEED(n) do { if (argc < (n)) fatal("%s expects at least %d argument(s)", name, n); } while (0)
 
     if (!strcmp(name, "strlen")) {

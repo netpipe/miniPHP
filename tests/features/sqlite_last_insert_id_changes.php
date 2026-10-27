@@ -1,0 +1,1 @@
+<?php $db = sqlite_open(":memory:"); sqlite_exec($db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v)"); for ($i = 0; $i < 5; $i++) { sqlite_exec($db, "INSERT INTO t (v) VALUES (?)", [$i]); } echo sqlite_last_insert_id($db), " "; echo sqlite_exec($db, "UPDATE t SET v = v + 1 WHERE id > ?", [2]), " ", sqlite_changes($db);

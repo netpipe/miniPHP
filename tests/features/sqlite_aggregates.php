@@ -1,0 +1,1 @@
+<?php $db = sqlite_open(":memory:"); sqlite_exec($db, "CREATE TABLE t (x INT); INSERT INTO t VALUES (1),(2),(4);"); var_dump(sqlite_query($db, "SELECT count(*) AS c, sum(x) AS s, avg(x) AS a, max(x) AS m, total(x) AS tt FROM t"));

@@ -1,0 +1,1 @@
+<?php $db = sqlite_open(":memory:"); sqlite_exec($db, "CREATE TABLE u (name TEXT); INSERT INTO u VALUES ('alice');"); $evil = "x' OR '1'='1"; var_dump(sqlite_query($db, "SELECT * FROM u WHERE name = ?", [$evil])); var_dump(count(sqlite_query($db, "SELECT * FROM u")));

@@ -1,0 +1,1 @@
+<?php $db = sqlite_open(":memory:"); sqlite_exec($db, "CREATE TABLE t (id INTEGER PRIMARY KEY)"); sqlite_exec($db, "INSERT INTO t VALUES (?)", [1]); var_dump(sqlite_exec($db, "INSERT INTO t VALUES (?)", [1])); echo sqlite_error($db);

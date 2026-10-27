@@ -1,0 +1,16 @@
+array(2) {
+  [0]=>
+  array(2) {
+    ["name"]=>
+    string(2) "bo"
+    ["age"]=>
+    int(31)
+  }
+  [1]=>
+  array(2) {
+    ["name"]=>
+    string(2) "cy"
+    ["age"]=>
+    int(40)
+  }
+}
