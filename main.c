@@ -27,7 +27,7 @@ enum {
     NT_INT, NT_FLOAT, NT_STR, NT_BOOL, NT_NULL, NT_VAR, NT_BINOP, NT_UNOP,
     NT_CALL, NT_INDEX, NT_ARRAY,
     NT_INCDEC, NT_TERNARY, NT_COALESCE, NT_BREAK, NT_CONTINUE,
-    NT_FOREACH, NT_UNSET
+    NT_FOREACH, NT_UNSET, NT_INCLUDE
 };
 
 enum {
@@ -47,7 +47,7 @@ enum {
     TK_ARROW, TK_BANG, TK_ANDAND, TK_OROR,
     TK_PLUS, TK_MINUS, TK_STAR, TK_SLASH, TK_PERCENT, TK_UNKNOWN,
     TK_INC, TK_DEC, TK_OPASSIGN, TK_QUESTION, TK_COLON, TK_COALESCE,
-    TK_BREAK, TK_CONTINUE, TK_FOREACH, TK_AS
+    TK_BREAK, TK_CONTINUE, TK_FOREACH, TK_AS, TK_INCLUDE
 };
 
 typedef struct Value Value;
@@ -94,6 +94,7 @@ typedef struct Func {
     NodeList* params;
     NodeList* body;
     struct Func* next;
+    Node* def;          /* the declaring node: the same one again is not a redeclaration */
 } Func;
 
 typedef struct Var {
@@ -245,6 +246,10 @@ static Node* new_incdec(Node* target, int delta, int prefix);
    a function body: a break cannot cross a call. */
 static int loop_depth = 0;
 
+/* The file the parser is reading, for __FILE__ / __DIR__ and for include
+   resolution ("the directory of the file doing the including"). */
+static const char* parse_file = "Standard input code";
+
 static uintptr_t stack_base = 0;
 static size_t stack_budget = 0;
 
@@ -277,6 +282,12 @@ static void assign_to(Node* target, Value* val, Env* env);
 static long long array_next_index(Value* arr);
 static long long double_to_ll(double d);
 static Value* v_str_n(const char* s, size_t n);
+static Value* do_include(Node* n, Env* env);
+static Func* find_func_lower(const char* lname);
+static void hoist_functions(NodeList* l);
+static NodeList* parse_program(void);
+static char* read_all(FILE* f);
+static char* preprocess_source(const char* src);
 static Value* call_user(Func* f, Value** args, int argc);
 static Value* builtin(const char* name, Value** args, int argc);
 
@@ -573,6 +584,16 @@ static void append_html_echo(Buf* out, const char* s, size_t n) {
     buf_addz(out, "\";\n");
 }
 
+/* PHP's closing tag swallows ONE newline straight after it ("\n" or
+   "\r\n"), for <?php ... ?> and <?= ... ?> alike. Without this every
+   template ending in "?>" plus a newline printed a stray line break -- and
+   in a page built from includes those add up. */
+static const char* skip_close_newline(const char* p) {
+    if (p[0] == '\n') return p + 1;
+    if (p[0] == '\r' && p[1] == '\n') return p + 2;
+    return p;
+}
+
 static char* preprocess_source(const char* src) {
     const char* first = find_tag(src);
 
@@ -613,7 +634,7 @@ static char* preprocess_source(const char* src) {
             buf_add(&out, p, n);
             buf_addz(&out, ";\n");
 
-            if (*close == '?') p = close + 2;
+            if (*close == '?') p = skip_close_newline(close + 2);
             else p = close;
         } else {
             const char* close = find_php_close(p);
@@ -622,7 +643,7 @@ static char* preprocess_source(const char* src) {
             buf_add(&out, p, n);
             buf_addz(&out, ";\n");
 
-            if (*close == '?') p = close + 2;
+            if (*close == '?') p = skip_close_newline(close + 2);
             else p = close;
         }
     }
@@ -741,6 +762,10 @@ static Token lex_next(void) {
         else if (!strcmp(lw, "for")) tt = TK_FOR;
         else if (!strcmp(lw, "break")) tt = TK_BREAK;
         else if (!strcmp(lw, "foreach")) tt = TK_FOREACH;
+        else if (!strcmp(lw, "include")) { tt = TK_INCLUDE; t.i = 0; }
+        else if (!strcmp(lw, "include_once")) { tt = TK_INCLUDE; t.i = 1; }
+        else if (!strcmp(lw, "require")) { tt = TK_INCLUDE; t.i = 2; }
+        else if (!strcmp(lw, "require_once")) { tt = TK_INCLUDE; t.i = 3; }
         else if (!strcmp(lw, "as")) tt = TK_AS;
         else if (!strcmp(lw, "continue")) tt = TK_CONTINUE;
         else if (!strcmp(lw, "function")) tt = TK_FUNCTION;
@@ -1407,8 +1432,22 @@ static Node* parse_primary(void) {
                 return n;
             }
 
+            /* Magic constants, fixed per file when it is parsed -- the
+               standard include idiom is include __DIR__ . "/lib.php". They
+               used to be plain strings: __DIR__ was the text "__DIR__". */
             Node* n = new_node(NT_STR);
-            n->s = name;
+            if (!strcasecmp(name, "__FILE__")) {
+                n->s = xstrdup(parse_file);
+            } else if (!strcasecmp(name, "__DIR__")) {
+                char* d = xstrdup(parse_file);
+                char* sl = strrchr(d, '/');
+                if (!sl) { free(d); d = xstrdup("."); }
+                else if (sl == d) d[1] = 0;            /* a file in / */
+                else *sl = 0;
+                n->s = d;
+            } else {
+                n->s = name;
+            }
             return n;
         }
 
@@ -1458,6 +1497,17 @@ static Node* parse_postfix(void) {
 }
 
 static Node* parse_unary_inner(void) {
+    if (cur.type == TK_INCLUDE) {
+        /* include/require take a whole expression: include $dir . "/a.php"
+           includes the concatenation, as in PHP. */
+        int kind = (int)cur.i;
+        adv();
+        Node* n = new_node(NT_INCLUDE);
+        n->i = kind;
+        n->a = parse_expr();
+        n->s = xstrdup(parse_file);           /* where the statement lives */
+        return n;
+    }
     if (match(TK_INC)) return new_incdec(parse_unary(), 1, 1);
     if (match(TK_DEC)) return new_incdec(parse_unary(), -1, 1);
     if (match(TK_BANG)) return new_unop(OP_NOT, parse_unary());
@@ -4434,6 +4484,9 @@ static Value* eval(Node* n, Env* env) {
             return n->i ? nv : old;
         }
 
+        case NT_INCLUDE:
+            return do_include(n, env);
+
         case NT_TERNARY: {
             Value* c = eval(n->a, env);
             if (val_truthy(c)) return n->b ? eval(n->b, env) : c;
@@ -4544,16 +4597,170 @@ static void assign_to(Node* target, Value* val, Env* env) {
     }
 }
 
+/* ---------- include / require (milestone 3) ---------- */
+
+/* Files already included, by REAL path, so include_once of "a.php",
+   "./a.php" and "/full/path/a.php" all count as the same file. The main
+   script is in the list too: include_once __FILE__ does nothing, as in PHP. */
+static char** inc_seen = 0;
+static int inc_n = 0, inc_cap = 0;
+
+static int inc_was_seen(const char* real) {
+    for (int i = 0; i < inc_n; i++) if (!strcmp(inc_seen[i], real)) return 1;
+    return 0;
+}
+
+static void inc_mark(const char* real) {
+    if (inc_n == inc_cap) {
+        inc_cap = inc_cap ? inc_cap * 2 : 16;
+        inc_seen = realloc(inc_seen, sizeof(char*) * (size_t)inc_cap);
+    }
+    inc_seen[inc_n++] = xstrdup(real);
+}
+
+static int readable_file(const char* p) {
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISREG(st.st_mode) && access(p, R_OK) == 0;
+}
+
+/* PHP's search order:
+     - an absolute path, or one starting "./" or "../", is used as given
+       (the last two relative to the current directory)
+     - anything else is looked for along include_path (PHPMINI_INCLUDE_PATH,
+       colon-separated, default "."), then in the directory of the file
+       that contains the include statement. */
+static char* resolve_include(const char* path, const char* from_file) {
+    if (!*path) return 0;
+    if (path[0] == '/' || !strncmp(path, "./", 2) || !strncmp(path, "../", 3))
+        return readable_file(path) ? xstrdup(path) : 0;
+
+    const char* ip = getenv("PHPMINI_INCLUDE_PATH");
+    if (!ip || !*ip) ip = ".";
+    char cand[4096];
+    const char* p = ip;
+    while (*p) {
+        const char* c = strchr(p, ':');
+        size_t dl = c ? (size_t)(c - p) : strlen(p);
+        if (dl) {
+            snprintf(cand, sizeof cand, "%.*s/%s", (int)dl, p, path);
+            if (readable_file(cand)) return xstrdup(cand);
+        }
+        if (!c) break;
+        p = c + 1;
+    }
+
+    const char* sl = from_file ? strrchr(from_file, '/') : 0;
+    if (sl) {
+        snprintf(cand, sizeof cand, "%.*s/%s", (int)(sl - from_file), from_file, path);
+        if (readable_file(cand)) return xstrdup(cand);
+    }
+    return 0;
+}
+
+/* Parse a whole file into a program. The lexer is global, and this runs in
+   the MIDDLE of executing another file, so everything it holds -- source,
+   position, current token, loop nesting, the file name -- is saved first
+   and put back after, or the including file would resume parsing nonsense. */
+static NodeList* parse_file_at(const char* real, char* code) {
+    char* s_src = lex_src;
+    size_t s_pos = lex_pos, s_len = lex_len;
+    Token s_cur = cur;
+    int s_loops = loop_depth;
+    const char* s_file = parse_file;
+
+    lex_src = code;
+    lex_len = strlen(code);
+    lex_pos = 0;
+    loop_depth = 0;          /* a break in an included file cannot reach out */
+    parse_file = real;
+    adv();
+    NodeList* prog = parse_program();
+
+    lex_src = s_src;
+    lex_pos = s_pos;
+    lex_len = s_len;
+    cur = s_cur;
+    loop_depth = s_loops;
+    parse_file = s_file;
+    return prog;
+}
+
+static Value* do_include(Node* n, Env* env) {
+    int once = n->i & 1, req = n->i & 2;
+    const char* what = req ? (once ? "require_once" : "require") : (once ? "include_once" : "include");
+    char* path = val_to_string(eval(n->a, env));
+    char* found = resolve_include(path, n->s);
+
+    if (!found) {
+        const char* ip = getenv("PHPMINI_INCLUDE_PATH");
+        if (!ip || !*ip) ip = ".";
+        /* include warns and carries on with false; require stops -- PHP's
+           split, and its wording */
+        fprintf(stderr, "PHP warning: %s(%s): Failed to open stream: No such file or directory\n", what, path);
+        if (req) fatal("Uncaught Error: Failed opening required '%s' (include_path='%s')", path, ip);
+        fprintf(stderr, "PHP warning: %s(): Failed opening '%s' for inclusion (include_path='%s')\n", what, path, ip);
+        free(path);
+        return v_bool(0);
+    }
+
+    char* real = realpath(found, 0);
+    if (!real) real = xstrdup(found);
+    free(found);
+    free(path);
+
+    if (once && inc_was_seen(real)) { free(real); return v_bool(1); }
+    if (!inc_was_seen(real)) inc_mark(real);
+
+    FILE* fp = fopen(real, "rb");
+    if (!fp) {
+        if (req) fatal("Uncaught Error: Failed opening required '%s'", real);
+        fprintf(stderr, "PHP warning: %s(%s): Failed to open stream\n", what, real);
+        free(real);
+        return v_bool(0);
+    }
+    char* raw = read_all(fp);
+    fclose(fp);
+
+    NodeList* prog = parse_file_at(real, preprocess_source(raw));
+    hoist_functions(prog);
+
+    /* The included code runs in the CURRENT scope -- inside a function its
+       variables are that function's locals, as in PHP. A top-level return
+       in the included file ends only that file, and is the include's value
+       ($config = include "config.php"); otherwise the value is 1. */
+    exec_list(prog, env);
+    Value* r = v_int(1);
+    if (in_ret) {
+        r = ret_val ? ret_val : v_null();
+        in_ret = 0;
+        ret_val = 0;
+    }
+    return r;
+}
+
 static void exec_list(NodeList* l, Env* env) {
     for (; l && !in_ret && !brk_n && !cont_n; l = l->next)
         exec(l->node, env);
 }
 
+/* A function is registered twice for the same declaration -- once when its
+   file is hoisted, once when execution reaches it -- and that is fine. A
+   DIFFERENT declaration of the same name is PHP's fatal "Cannot redeclare",
+   which matters now that a file can be included twice: before, the second
+   definition silently replaced the first. */
 static void register_func_node(Node* n) {
+    char* lname = lower_dup(n->s);
+    Func* old = find_func_lower(lname);
+    if (old) {
+        free(lname);
+        if (old->def == n) return;
+        fatal("Cannot redeclare function %s()", n->s);
+    }
     Func* f = calloc(1, sizeof(Func));
     if (!f) fatal("out of memory");
 
-    f->name = lower_dup(n->s);
+    f->def = n;
+    f->name = lname;
     f->params = n->l1;
     f->body = n->l2;
     f->next = funcs;
@@ -4764,6 +4971,26 @@ int main(int argc, char** argv) {
         }
 
         close_f = 1;
+
+        /* The main script's real path: __FILE__, and the first entry in the
+           include_once list. */
+        char* real = realpath(fname, 0);
+        if (real) {
+            parse_file = real;
+            inc_mark(real);
+            /* Under CGI, run from the script's own directory, as php-cgi and
+               PHP-FPM do -- so include "lib.php", fopen("data.txt") and
+               move_uploaded_file(..., "uploads/x") mean what they mean on a
+               real PHP server, wherever the web server happened to start. */
+            const char* rm = getenv("REQUEST_METHOD");
+            if (rm && *rm) {
+                char* d = xstrdup(real);
+                char* sl = strrchr(d, '/');
+                if (sl) { if (sl == d) sl[1] = 0; else *sl = 0; }
+                if (chdir(d) != 0) { /* stay where we are */ }
+                free(d);
+            }
+        }
         free(fname);
     }
 
