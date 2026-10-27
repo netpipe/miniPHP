@@ -122,6 +122,54 @@ printf 'a:999999999999:{' > "$W/sess/sess_CorruptSessionFile00001"
 expect "a corrupt session file does not hang or crash" \
        "$(cgi '<?php session_start(); echo "alive";' HTTP_COOKIE="PHPSESSID=CorruptSessionFile00001")" 'alive$'
 
+echo "-- uploads (milestone 4) --"
+# post <php-source> <body-file> [extra env...] -> CGI response to a multipart POST
+B=XyZB0undary
+post() { src=$1; bf=$2; shift 2; printf '%s' "$src" > "$W/t.php"
+         env REQUEST_METHOD=POST GATEWAY_INTERFACE=CGI/1.1 PHPMINI_SESSION_PATH="$W/sess" \
+             CONTENT_TYPE="multipart/form-data; boundary=$B" CONTENT_LENGTH=$(wc -c < "$bf") \
+             PHPMINI_UPLOAD_TMP_DIR="$W/tmp" "$@" timeout 30 "$BIN" "$W/t.php" < "$bf" 2>&1 | tr -d '\r'; }
+mkdir -p "$W/tmp" "$W/dest"
+printf -- '--%s\r\nContent-Disposition: form-data; name="f"; filename="../../evil.php"\r\nContent-Type: text/plain\r\n\r\nUPLOADED-BYTES\r\n--%s--\r\n' $B $B > "$W/up1"
+
+out=$(post '<?php echo $_FILES["f"]["name"], "|", $_FILES["f"]["size"], "|", $_FILES["f"]["error"];' "$W/up1")
+expect "an upload arrives in \$_FILES, its name cut to a plain filename" "$out" 'evil\.php\|14\|0$'
+
+out=$(post '<?php echo move_uploaded_file($_FILES["f"]["tmp_name"], "'"$W"'/dest/" . $_FILES["f"]["name"]) ? "moved" : "refused";' "$W/up1")
+[ "$(cat "$W/dest/evil.php" 2>/dev/null)" = "UPLOADED-BYTES" ] && ok "move_uploaded_file() moves it, bytes intact, and inside dest/" \
+    || bad "move_uploaded_file() moves it, bytes intact, and inside dest/" "$out"
+[ ! -e "$W/evil.php" ] && ok "the ../../ in the sent name did not escape dest/" || bad "the ../../ in the sent name did not escape dest/" "found $W/evil.php"
+
+out=$(post '<?php echo move_uploaded_file("/etc/passwd", "'"$W"'/dest/stolen") ? "MOVED" : "refused";' "$W/up1")
+if printf '%s' "$out" | tail -1 | grep -qx refused && [ ! -e "$W/dest/stolen" ]; then ok "move_uploaded_file() refuses a path that was not uploaded (/etc/passwd)"
+else bad "move_uploaded_file() refuses a path that was not uploaded (/etc/passwd)" "$out"; fi
+
+out=$(post '<?php $t = $_FILES["f"]["tmp_name"]; $a = move_uploaded_file($t, "'"$W"'/dest/one"); $b = move_uploaded_file($t, "'"$W"'/dest/two"); echo $a ? "1" : "0", $b ? "1" : "0", is_uploaded_file($t) ? "1" : "0";' "$W/up1")
+expect "a second move of the same upload is refused" "$out" '^100$'
+
+out=$(post '<?php echo is_uploaded_file($_FILES["f"]["tmp_name"]) ? "y" : "n", is_uploaded_file("/etc/passwd") ? "y" : "n";' "$W/up1")
+expect "is_uploaded_file() knows its own uploads only" "$out" '^yn$'
+
+rm -rf "$W/tmp"/*
+post '<?php $t = $_FILES["f"]["tmp_name"]; echo "listing"; undefined_function_to_die();' "$W/up1" >/dev/null
+left=$(ls "$W/tmp" | wc -l)
+[ "$left" -eq 0 ] && ok "temp files are deleted even when the script dies with a fatal error" \
+                  || bad "temp files are deleted even when the script dies with a fatal error" "$left left in tmp/"
+
+# The temp file only exists while the request runs, so its creation is checked
+# at the system call: it must be O_EXCL (never reuses or follows an existing
+# path) and 0600 (private), even with a permissive umask.
+printf '<?php echo $_FILES["f"]["tmp_name"];' > "$W/t.php"
+mode=$(sh -c 'umask 000; env REQUEST_METHOD=POST GATEWAY_INTERFACE=CGI/1.1 CONTENT_TYPE="multipart/form-data; boundary='$B'" CONTENT_LENGTH=$(wc -c < "'"$W/up1"'") PHPMINI_UPLOAD_TMP_DIR="'"$W/tmp"'" strace -f -e trace=openat -o "'"$W/strace"'" "'"$BIN"'" "'"$W/t.php"'" < "'"$W/up1"'" >/dev/null 2>&1; grep -o "php[A-Za-z0-9]\{6\}\", O_RDWR|O_CREAT|O_EXCL, 0600" "'"$W/strace"'" | head -1' 2>/dev/null)
+if [ -n "$mode" ]; then ok "temp files are created 0600 with O_EXCL (mkstemp)"
+elif ! command -v strace >/dev/null; then ok "temp-file mode check skipped (no strace)"
+else bad "temp files are created 0600 with O_EXCL (mkstemp)" "no matching openat in strace"; fi
+
+big=$W/big; : > "$big"
+out=$(printf '<?php echo count($_POST), count($_FILES);' > "$W/t.php"; env REQUEST_METHOD=POST GATEWAY_INTERFACE=CGI/1.1 \
+      CONTENT_TYPE="multipart/form-data; boundary=$B" CONTENT_LENGTH=104857600 timeout 10 "$BIN" "$W/t.php" < "$big" 2>&1 | tr -d '\r')
+expect "a body over post_max_size is not read (100 MB claimed, 8 MB limit)" "$out" 'exceeds the limit'
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

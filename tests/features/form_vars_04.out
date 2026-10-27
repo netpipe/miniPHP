@@ -1,0 +1,13 @@
+array(1) {
+  ["a"]=>
+  array(1) {
+    ["x"]=>
+    array(1) {
+      ["y"]=>
+      array(1) {
+        ["z"]=>
+        string(4) "deep"
+      }
+    }
+  }
+}

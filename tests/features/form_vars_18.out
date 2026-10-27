@@ -1,0 +1,9 @@
+array(1) {
+  ["a"]=>
+  array(2) {
+    [0]=>
+    string(1) "x"
+    [1]=>
+    string(1) "y"
+  }
+}

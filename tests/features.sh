@@ -15,7 +15,14 @@ export ASAN_OPTIONS=detect_leaks=0
 pass=0; fail=0
 for t in "$ROOT"/tests/features/*.php; do
     name=$(basename "$t" .php)
-    timeout 10 "$W/php" "$t" > "$W/got" 2> "$W/err"
+    if [ -f "${t%.php}.qs" ]; then
+        # NAME.qs: run as a web request with that query string; the .out was
+        # made by real PHP from parse_str(), the code that fills $_GET
+        env REQUEST_METHOD=GET GATEWAY_INTERFACE=CGI/1.1 QUERY_STRING="$(cat "${t%.php}.qs")" \
+            timeout 10 "$W/php" "$t" 2> "$W/err" | tr -d '\r' | sed '1,/^$/d' > "$W/got"
+    else
+        timeout 10 "$W/php" "$t" > "$W/got" 2> "$W/err"
+    fi
     if cmp -s "$W/got" "${t%.php}.out" && ! grep -qE 'runtime error|AddressSanitizer' "$W/err"; then
         pass=$((pass + 1))
     else
