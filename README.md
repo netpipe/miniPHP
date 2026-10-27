@@ -1,11 +1,10 @@
 # miniPHP
 a minature version of PHP<br>
 <br>
-echo, variables, scalars, arrays ([] and array()), arithmetic, concatenation, comparisons, if/elseif/else, while, for, foreach,user functions, return, and several builtins.<br>
+echo, variables, scalars, arrays ([] and array()), arithmetic, concatenation, comparisons, if/elseif/else, while, for, foreach,user functions, return, and several builtins.<br>include, multipart/form-data, file uploads, sqlite(next push)
 <br>
-still lacks many things: classes, exceptions, include, multipart/form-data, file uploads, robust locking, full standard library, etc. But it is a reasonably complete little CGI/session-capable PHP-like runtime in one C file.
+still lacks many things: classes, exceptions, robust locking, full standard library, etc. But it is a reasonably complete little CGI/session-capable PHP-like runtime in one C file.
 <br><br>
-* planned future features include sqlite,file uploads,include, multipart/form-data <br>
 
 ### CGI features
 * ?a=test query parsing<br>
