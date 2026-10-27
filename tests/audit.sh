@@ -211,6 +211,37 @@ printf '<?php $d = sqlite_open(":memory:"); $r = sqlite_query($d, "WITH RECURSIV
 out=$(env REQUEST_METHOD=GET GATEWAY_INTERFACE=CGI/1.1 PHPMINI_MEMORY_LIMIT=64M timeout 60 "$W/plain" "$W/t.php" 2>&1)
 expect "a 20-million-row result hits memory_limit cleanly, no crash" "$out" 'Allowed memory size'
 
+echo "-- binary-safe strings (milestone 6) --"
+# A zero byte is now ordinary string data, so every place a string becomes a
+# C path or header must refuse it -- or "secret.php\0.jpg" opens secret.php.
+printf '<?php echo "SECRET-SOURCE";' > "$W/secret.php"
+out=$(q 'include "secret.php" . chr(0) . ".jpg"; echo "|done";' | tr '\n' ' ')
+case "$out" in *SECRET-SOURCE*) bad "include refuses a path with a zero byte (does not open the part before it)" "$out";;
+    *) expect "include refuses a path with a zero byte (does not open the part before it)" "$out" "Failed opening 'secret.php'.*\|done";; esac
+expect "require of such a path stops the script, as in PHP" "$(q 'require "secret.php" . chr(0) . "x"; echo "ran-on";')" "Failed opening required"
+out=$(cgi '<?php header("X-Test: a" . chr(0) . "Injected: yes"); echo "body";')
+case "$out" in *Injected*) bad "header() with a zero byte is dropped with PHP's warning" "$(printf '%s' "$out" | tr '\n' ' ')";;
+    *) expect "header() with a zero byte is dropped with PHP's warning" "$out" "Header may not contain NUL bytes";; esac
+expect "is_uploaded_file() with a zero byte is PHP's ValueError" \
+       "$(q 'is_uploaded_file("/etc/passwd" . chr(0)); echo "ran-on";')" 'ValueError: is_uploaded_file\(\).*null bytes'
+expect "move_uploaded_file() to a path with a zero byte is PHP's ValueError" \
+       "$(q 'move_uploaded_file("/tmp/x", "/tmp/a" . chr(0) . ".php"); echo "ran-on";')" 'ValueError: move_uploaded_file\(\): Argument #2'
+expect "sqlite_open() of a path with a zero byte is refused" \
+       "$(q 'sqlite_open("db.sqlite" . chr(0) . ".txt"); echo "ran-on";')" 'null bytes'
+[ -e "$W/db.sqlite" ] && bad "the truncated database name was not created" "$W/db.sqlite exists" || ok "the truncated database name was not created"
+
+out=$(cgi '<?php echo bin2hex($_GET["v"]), "|", strlen($_GET["v"]);' QUERY_STRING='v=a%00b%00')
+expect "a %00 in the query string arrives as a real zero byte (was cut to \"a\")" "$out" '^61006200\|4$'
+id=$(cgi '<?php session_start(); $_SESSION["k"] = "a" . chr(0) . "b"; $_SESSION["z" . chr(0)] = chr(255) . chr(0); echo "set";' \
+     | sed -n 's/^Set-Cookie: PHPSESSID=\([a-f0-9]*\).*/\1/p')
+expect "a session value and key with zero bytes survive to the next request" \
+       "$(cgi '<?php session_start(); foreach ($_SESSION as $k => $v) echo bin2hex($k), "=", bin2hex($v), ";";' HTTP_COOKIE="PHPSESSID=$id")" '6b=610062;7a00=ff00;$'
+# Expected values are what PHP's PDO sqlite driver returns for the same calls.
+# (PHP's SQLite3 class cuts TEXT at the first zero byte when fetching; the
+# stored bytes are the same either way.)
+expect "SQLite stores and returns TEXT with zero bytes intact" \
+       "$(q '$d = sqlite_open(":memory:"); sqlite_exec($d, "CREATE TABLE t (x TEXT)"); sqlite_query($d, "INSERT INTO t VALUES (?), (?)", ["a", "a" . chr(0) . "b"]); $r = sqlite_query($d, "SELECT x, hex(x) AS h FROM t WHERE x = ?", ["a" . chr(0) . "b"]); echo count($r), " ", bin2hex($r[0]["x"]), " ", $r[0]["h"];')" '^1 610062 610062$'
+
 out=$( (cd "$W" && cp "$ROOT/main.c" . && gcc -std=c11 -DMINIPHP_NO_SQLITE -o nosq main.c -lm 2>&1 && printf '<?php echo strlen("ok"); sqlite_open(":memory:");' > n.php && ./nosq n.php 2>&1) )
 out=$(printf '%s' "$out" | tr '\n' ' ')
 case "$out" in *"Undefined function sqlite_open"*) case "$out" in *2*) ok "built without SQLite (make nosqlite): still works, sqlite_* undefined";; *) bad "built without SQLite" "$out";; esac;; *) bad "built without SQLite (make nosqlite): still works, sqlite_* undefined" "$out";; esac

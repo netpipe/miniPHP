@@ -72,6 +72,7 @@ struct Node {
     long long i;
     double d;
     char* s;
+    size_t n;          /* NT_STR from a literal: byte length (0: use strlen) */
     Node *a, *b, *c;
     NodeList *l1, *l2;
     Pair* pairs;
@@ -90,6 +91,12 @@ struct Value {
     char* s;
     int b;
     ArrayItem* items;
+    /* BINARY-SAFE STRINGS: a string's length lives here, not in a
+       terminating zero, so "a\0b" is three bytes long (crypto keys, SQLite
+       blobs and uploaded data are full of zero bytes). s is still always
+       zero-terminated after its n bytes, for C APIs. SIZE_MAX means "not
+       recorded" and falls back to strlen() -- see slen() below. */
+    size_t n;
 };
 
 typedef struct Func {
@@ -114,6 +121,7 @@ typedef struct Env {
 typedef struct Token {
     int type;
     char* text;
+    size_t n;          /* TK_STR: byte length -- "\0" makes strlen wrong */
     long long i;
     double d;
 } Token;
@@ -223,7 +231,6 @@ static void* mp_realloc(void* q, size_t n) {
 #define realloc(q, n) mp_realloc(q, n)
 static char* xstrdup(const char* s);
 static char* lower_dup(const char* s);
-static char* case_dup(const char* s, int up);
 
 static Node* parse_expr(void);
 static Node* parse_statement(void);   /* used by parse_block before it is defined */
@@ -285,6 +292,7 @@ static void assign_to(Node* target, Value* val, Env* env);
 static long long array_next_index(Value* arr);
 static long long double_to_ll(double d);
 static Value* v_str_n(const char* s, size_t n);
+static char* val_to_string(Value* v);
 static Value* do_include(Node* n, Env* env);
 static Func* find_func_lower(const char* lname);
 static void hoist_functions(NodeList* l);
@@ -326,12 +334,16 @@ static char* lower_dup(const char* s) {
     return r;
 }
 
-static char* case_dup(const char* s, int up) {
-    char* r = xstrdup(s);
-    for (char* p = r; *p; p++)
-        *p = (char)(up ? toupper((unsigned char)*p) : tolower((unsigned char)*p));
+static char* case_dup_n(const char* s, size_t n, int up) {
+    char* r = malloc(n + 1);
+    if (!r) fatal("out of memory");
+    for (size_t i = 0; i < n; i++)
+        r[i] = (char)(up ? toupper((unsigned char)s[i]) : tolower((unsigned char)s[i]));
+    r[n] = 0;
     return r;
 }
+
+
 
 static void buf_init(Buf* b) {
     b->data = 0;
@@ -391,15 +403,20 @@ static void buf_fmt(Buf* b, const char* fmt, ...) {
     free(tmp);
 }
 
-static char* read_all(FILE* f) {
+/* The whole stream; *n (if given) gets the byte count, which zero bytes
+   inside the data would otherwise hide from strlen. */
+static char* read_all_n(FILE* f, size_t* n) {
     Buf b;
     buf_init(&b);
     int c;
     while ((c = fgetc(f)) != EOF)
         buf_ch(&b, (char)c);
+    if (n) *n = b.len;
     if (!b.data) return xstrdup("");
     return b.data;
 }
+
+static char* read_all(FILE* f) { return read_all_n(f, 0); }
 
 static int hexval(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -408,50 +425,121 @@ static int hexval(char c) {
     return -1;
 }
 
-static char* url_decode(const char* s) {
+/* Decodes n bytes; %00 becomes a real zero byte, and the decoded length
+   comes back in *outn. (It used to stop there: ?v=a%00b arrived as "a".) */
+static char* url_decode_raw(const char* s, size_t n, size_t* outn, int plus) {
     Buf b;
     buf_init(&b);
-    if (!s) return xstrdup("");
-
-    for (size_t i = 0; s[i]; i++) {
-        if (s[i] == '+') {
+    for (size_t i = 0; s && i < n; i++) {
+        if (plus && s[i] == '+') {
             buf_ch(&b, ' ');
-        } else if (s[i] == '%' && hexval(s[i+1]) >= 0 && hexval(s[i+2]) >= 0) {
-            char h[3] = { s[i+1], s[i+2], 0 };
-            buf_ch(&b, (char)strtol(h, 0, 16));
+        } else if (s[i] == '%' && i + 2 < n && hexval(s[i+1]) >= 0 && hexval(s[i+2]) >= 0) {
+            buf_ch(&b, (char)(hexval(s[i+1]) * 16 + hexval(s[i+2])));
             i += 2;
         } else {
             buf_ch(&b, s[i]);
         }
     }
-
+    *outn = b.len;
     return b.data ? b.data : xstrdup("");
+}
+
+/* urldecode(): "+" is a space, as in a query string or form body */
+static char* url_decode_n(const char* s, size_t n, size_t* outn) {
+    return url_decode_raw(s, n, outn, 1);
+}
+
+static char* url_decode(const char* s) {
+    size_t n;
+    return url_decode_n(s ? s : "", s ? strlen(s) : 0, &n);
 }
 
 static int url_unreserved(char c) {
     return isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~';
 }
 
-static char* url_encode(const char* s) {
+/* raw: rawurlencode() (RFC 3986, a space is %20) -- also what setcookie()
+   uses. Otherwise urlencode(): a space is "+" and "~" is encoded. */
+static char* url_encode_n(const char* s, size_t n, int raw) {
     Buf b;
     buf_init(&b);
     if (!s) return xstrdup("");
 
-    for (size_t i = 0; s[i]; i++) {
+    for (size_t i = 0; i < n; i++) {
         unsigned char c = (unsigned char)s[i];
-        if (url_unreserved((char)c)) buf_ch(&b, (char)c);
+        if (!raw && c == ' ') buf_ch(&b, '+');
+        else if (url_unreserved((char)c) && (raw || c != '~')) buf_ch(&b, (char)c);
         else buf_fmt(&b, "%%%02X", c);
     }
 
     return b.data ? b.data : xstrdup("");
 }
 
-static char* html_escape(const char* s) {
+static char* url_encode(const char* s) { return url_encode_n(s, s ? strlen(s) : 0, 1); }
+
+/* 0 if a valid UTF-8 character starts at s[i] (or it is ASCII); otherwise
+   how many bytes PHP's decoder (ext/standard/html.c) swallows as one invalid
+   sequence. Those exact counts decide how many U+FFFD come out. */
+static int utf8_lead(unsigned char c) { return c < 0x80 || (c >= 0xC2 && c <= 0xF4); }
+static int utf8_trail(unsigned char c) { return c >= 0x80 && c <= 0xBF; }
+
+static size_t utf8_invalid_len(const char* str, size_t n, size_t i) {
+    const unsigned char* s = (const unsigned char*)str + i;
+    size_t avail = n - i;
+    unsigned c = s[0], cp;
+    if (c < 0x80) return 0;
+    if (c < 0xC2) return 1;
+    if (c < 0xE0) {
+        if (avail < 2) return 1;
+        if (!utf8_trail(s[1])) return utf8_lead(s[1]) ? 1 : 2;
+        return 0;
+    }
+    if (c < 0xF0) {
+        if (avail < 3 || !utf8_trail(s[1]) || !utf8_trail(s[2])) {
+            if (avail < 2 || utf8_lead(s[1])) return 1;
+            if (avail < 3 || utf8_lead(s[2])) return 2;
+            return 3;
+        }
+        cp = ((c & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+        if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF)) return 3;   /* overlong, surrogate */
+        return 0;
+    }
+    if (c < 0xF5) {
+        if (avail < 4 || !utf8_trail(s[1]) || !utf8_trail(s[2]) || !utf8_trail(s[3])) {
+            if (avail < 2 || utf8_lead(s[1])) return 1;
+            if (avail < 3 || utf8_lead(s[2])) return 2;
+            if (avail < 4 || utf8_lead(s[3])) return 3;
+            return 4;
+        }
+        cp = ((c & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+        if (cp < 0x10000 || cp > 0x10FFFF) return 4;
+        return 0;
+    }
+    return 1;
+}
+
+static char* html_escape_n(const char* s, size_t n, size_t* outn) {
     Buf b;
     buf_init(&b);
+    *outn = 0;
     if (!s) return xstrdup("");
 
-    for (size_t i = 0; s[i]; i++) {
+    for (size_t i = 0; i < n; ) {
+        size_t bad = utf8_invalid_len(s, n, i);
+        if (bad) {
+            /* ENT_SUBSTITUTE, PHP 8.1's default: a broken UTF-8 sequence
+               becomes U+FFFD instead of passing through to the page */
+            buf_addz(&b, "\xEF\xBF\xBD");
+            i += bad;
+            continue;
+        }
+        unsigned char c = (unsigned char)s[i];
+        if (c >= 0x80) {        /* a valid multi-byte character, whole */
+            size_t len = c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+            buf_add(&b, s + i, len);
+            i += len;
+            continue;
+        }
         switch (s[i]) {
             case '&': buf_addz(&b, "&amp;"); break;
             case '<': buf_addz(&b, "&lt;"); break;
@@ -460,10 +548,14 @@ static char* html_escape(const char* s) {
             case '\'': buf_addz(&b, "&#039;"); break;
             default: buf_ch(&b, s[i]); break;
         }
+        i++;
     }
 
+    *outn = b.len;
     return b.data ? b.data : xstrdup("");
 }
+
+
 
 static void format_http_date(time_t t, char* out, size_t n) {
     static const char* wd[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
@@ -872,14 +964,73 @@ static Token lex_next(void) {
                         buf_ch(&b, e);
                     }
                 } else {
+                    /* PHP's double-quoted escapes. An unknown one (including
+                       \') keeps its backslash, as in PHP. */
                     switch (e) {
                         case 'n': buf_ch(&b, '\n'); break;
                         case 't': buf_ch(&b, '\t'); break;
                         case 'r': buf_ch(&b, '\r'); break;
+                        case 'v': buf_ch(&b, '\v'); break;
+                        case 'e': buf_ch(&b, 0x1b); break;
+                        case 'f': buf_ch(&b, '\f'); break;
                         case '\\': buf_ch(&b, '\\'); break;
                         case '"': buf_ch(&b, '"'); break;
-                        case '\'': buf_ch(&b, '\''); break;
-                        case '0': buf_ch(&b, '0'); break;
+                        case '$': buf_ch(&b, '$'); break;
+                        case '0': case '1': case '2': case '3':
+                        case '4': case '5': case '6': case '7': {
+                            /* \0 .. \377, one to three octal digits; PHP keeps
+                               the low byte of anything larger */
+                            size_t from = lex_pos - 1;
+                            int v = e - '0';
+                            for (int k = 0; k < 2 && lex_pos < lex_len &&
+                                 lex_src[lex_pos] >= '0' && lex_src[lex_pos] <= '7'; k++)
+                                v = v * 8 + (lex_src[lex_pos++] - '0');
+                            if (v > 0xff)
+                                fprintf(stderr, "PHP warning: Octal escape sequence overflow \\%.*s is greater than \\377\n",
+                                        (int)(lex_pos - from), lex_src + from);
+                            buf_ch(&b, (char)(v & 0xff));
+                            break;
+                        }
+                        case 'x': {
+                            int v = 0, k = 0;
+                            while (k < 2 && lex_pos < lex_len && hexval(lex_src[lex_pos]) >= 0)
+                                v = v * 16 + hexval(lex_src[lex_pos++]), k++;
+                            if (k) buf_ch(&b, (char)v);
+                            else { buf_ch(&b, '\\'); buf_ch(&b, 'x'); }
+                            break;
+                        }
+                        case 'u': {
+                            /* \u{1F600} -> UTF-8; "\u" without a brace is literal */
+                            if (lex_pos >= lex_len || lex_src[lex_pos] != '{') {
+                                buf_ch(&b, '\\'); buf_ch(&b, 'u');
+                                break;
+                            }
+                            size_t q = lex_pos + 1;
+                            unsigned long cp = 0;
+                            int k = 0;
+                            while (q < lex_len && hexval(lex_src[q]) >= 0 && k < 8)
+                                cp = cp * 16 + hexval(lex_src[q++]), k++;
+                            if (!k || q >= lex_len || lex_src[q] != '}')
+                                fatal("Syntax error: Invalid UTF-8 codepoint escape sequence");
+                            if (cp > 0x10FFFF)
+                                fatal("Syntax error: Invalid UTF-8 codepoint escape sequence: Codepoint too large");
+                            lex_pos = q + 1;
+                            if (cp < 0x80) buf_ch(&b, (char)cp);
+                            else if (cp < 0x800) {
+                                buf_ch(&b, (char)(0xC0 | (cp >> 6)));
+                                buf_ch(&b, (char)(0x80 | (cp & 0x3F)));
+                            } else if (cp < 0x10000) {
+                                buf_ch(&b, (char)(0xE0 | (cp >> 12)));
+                                buf_ch(&b, (char)(0x80 | ((cp >> 6) & 0x3F)));
+                                buf_ch(&b, (char)(0x80 | (cp & 0x3F)));
+                            } else {
+                                buf_ch(&b, (char)(0xF0 | (cp >> 18)));
+                                buf_ch(&b, (char)(0x80 | ((cp >> 12) & 0x3F)));
+                                buf_ch(&b, (char)(0x80 | ((cp >> 6) & 0x3F)));
+                                buf_ch(&b, (char)(0x80 | (cp & 0x3F)));
+                            }
+                            break;
+                        }
                         default:
                             buf_ch(&b, '\\');
                             buf_ch(&b, e);
@@ -894,6 +1045,7 @@ static Token lex_next(void) {
         lex_pos++;
 
         t.type = TK_STR;
+        t.n = b.len;
         t.text = b.data ? b.data : xstrdup("");
         return t;
     }
@@ -1368,6 +1520,7 @@ static Node* parse_primary(void) {
         case TK_STR: {
             Node* n = new_node(NT_STR);
             n->s = cur.text;
+            n->n = cur.n;
             adv();
             return n;
         }
@@ -1629,6 +1782,22 @@ static Value* v_new(int type) {
     Value* v = calloc(1, sizeof(Value));
     if (!v) fatal("out of memory");
     v->type = type;
+    v->n = SIZE_MAX;            /* a string's length is set by whoever fills s */
+    return v;
+}
+
+/* A string's length. Every string Value made by v_str/v_str_n/v_str_own
+   records it; SIZE_MAX (never recorded) means a C string, and is measured. */
+static size_t slen(Value* v) {
+    if (!v || !v->s) return 0;
+    return v->n != SIZE_MAX ? v->n : strlen(v->s);
+}
+
+/* Take ownership of a malloc'd buffer of n bytes (zero-terminated at n). */
+static Value* v_str_own(char* p, size_t n) {
+    Value* v = v_new(T_STRING);
+    v->s = p;
+    v->n = n;
     return v;
 }
 
@@ -1656,7 +1825,8 @@ static Value* v_null(void) {
 
 static Value* v_str(const char* s) {
     Value* v = v_new(T_STRING);
-    v->s = xstrdup(s);
+    v->s = xstrdup(s ? s : "");
+    v->n = strlen(v->s);
     return v;
 }
 
@@ -1678,7 +1848,7 @@ static void array_append_raw(Value* arr, Value* key, Value* val) {
 static Value* val_clone(Value* v) {
     if (!v) return v_null();
 
-    if (v->type == T_STRING) return v_str(v->s);
+    if (v->type == T_STRING) return v_str_n(v->s ? v->s : "", slen(v));
 
     if (v->type == T_ARRAY) {
         Value* n = v_new(T_ARRAY);
@@ -1710,26 +1880,63 @@ static Value* normalize_key(Value* k) {
                other -- a zip code "05" and an id "5" were the same key, and
                "99999999999999999999" landed on PHP_INT_MAX. */
             const char* s = k->s ? k->s : "";
-            const char* p = s;
+            size_t n = slen(k);
+            size_t i = 0;
             int canonical = 0;
-            if (*p == '-') p++;
-            if (p[0] == '0' && p[1] == 0 && p == s) canonical = 1;          /* "0" */
-            else if (*p >= '1' && *p <= '9') {
-                const char* q = p;
-                while (*q >= '0' && *q <= '9') q++;
-                canonical = (*q == 0) && (q - p) <= 19;
+            if (i < n && s[i] == '-') i++;
+            if (n == 1 && s[0] == '0') canonical = 1;                       /* "0" */
+            else if (i < n && s[i] >= '1' && s[i] <= '9') {
+                size_t q = i;
+                while (q < n && s[q] >= '0' && s[q] <= '9') q++;
+                canonical = (q == n) && (q - i) <= 19;   /* "5\0x" is NOT 5 */
             }
             if (canonical) {
                 errno = 0;
                 char* end = 0;
                 long long iv = strtoll(s, &end, 10);
-                if (errno == 0 && end && *end == 0) return v_int(iv);  /* fits */
+                if (errno == 0 && end == s + n) return v_int(iv);      /* fits */
             }
-            return v_str(s);
+            return v_str_n(s, n);
         }
         default:
             return v_str("Array");
     }
+}
+
+/* Compare two strings byte for byte, zero bytes included: memcmp over the
+   shorter length, then the shorter one sorts first -- what strcmp does for
+   C strings, and what PHP does for binary strings. */
+static int str_cmp_v(Value* a, Value* b) {
+    size_t la = slen(a), lb = slen(b);
+    int r = memcmp(a->s ? a->s : "", b->s ? b->s : "", la < lb ? la : lb);
+    if (r) return r;
+    return la < lb ? -1 : (la > lb ? 1 : 0);
+}
+
+/* A Value's bytes as a malloc'd, zero-terminated copy, with the real
+   length in *n. For a string that is every byte, zero bytes included --
+   val_to_string() is the C-string view and stops at the first zero. */
+static char* val_bin(Value* v, size_t* n) {
+    if (v && v->type == T_STRING) {
+        size_t l = slen(v);
+        char* p = malloc(l + 1);
+        memcpy(p, v->s ? v->s : "", l);
+        p[l] = 0;
+        *n = l;
+        return p;
+    }
+    char* p = val_to_string(v);
+    *n = strlen(p);
+    return p;
+}
+
+/* A string about to become a C string for the OS -- a path, a header. A
+   zero byte inside it would make the C side see a SHORTER string than PHP
+   does: "secret\0.php" names the file "secret". Before strings were
+   binary-safe the zero byte was cut off long before it got here; now it
+   survives, so every such boundary checks for it, as PHP 8 does. */
+static int has_nul(Value* v) {
+    return v && v->type == T_STRING && v->s && memchr(v->s, 0, slen(v)) != 0;
 }
 
 static int scalar_same(Value* a, Value* b) {
@@ -1740,7 +1947,7 @@ static int scalar_same(Value* a, Value* b) {
         case T_INT: return a->i == b->i;
         case T_FLOAT: return a->d == b->d;
         case T_BOOL: return a->b == b->b;
-        case T_STRING: return strcmp(a->s ? a->s : "", b->s ? b->s : "") == 0;
+        case T_STRING: return str_cmp_v(a, b) == 0;
         case T_NULL: return 1;
         default: return 0;
     }
@@ -1791,20 +1998,6 @@ static void array_put(Value* arr, Value* key, Value* val) {
 
     if (it) it->val = val;
     else array_append_raw(arr, nk, val);
-}
-
-static char* concat_str(const char* a, const char* b) {
-    if (!a) a = "";
-    if (!b) b = "";
-
-    size_t la = strlen(a), lb = strlen(b);
-    char* r = malloc(la + lb + 1);
-    if (!r) fatal("out of memory");
-
-    memcpy(r, a, la);
-    memcpy(r + la, b, lb);
-    r[la + lb] = 0;
-    return r;
 }
 
 /* Floats formatted the way PHP prints them.
@@ -1898,6 +2091,32 @@ static char* val_to_string(Value* v) {
     }
 }
 
+/* PHP 8's numeric string: optional whitespace, sign, digits with an optional
+   fraction (at least one digit), optional exponent, optional trailing
+   whitespace -- and nothing else, up to the real end. strtod() alone also
+   accepted "", " ", "0x1A", "inf" and "1\0junk", so " " == 0 was true. */
+static int is_numeric_bytes(const char* s, size_t n) {
+    size_t i = 0, digits = 0;
+    while (i < n && strchr(" \t\n\r\v\f", s[i]) && s[i]) i++;
+    if (i < n && (s[i] == '+' || s[i] == '-')) i++;
+    while (i < n && isdigit((unsigned char)s[i])) i++, digits++;
+    if (i < n && s[i] == '.') {
+        i++;
+        while (i < n && isdigit((unsigned char)s[i])) i++, digits++;
+    }
+    if (!digits) return 0;
+    if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+        size_t j = i + 1;
+        if (j < n && (s[j] == '+' || s[j] == '-')) j++;
+        if (j < n && isdigit((unsigned char)s[j])) {
+            while (j < n && isdigit((unsigned char)s[j])) j++;
+            i = j;
+        }
+    }
+    while (i < n && strchr(" \t\n\r\v\f", s[i]) && s[i]) i++;
+    return i == n;
+}
+
 static int val_is_numeric(Value* v) {
     if (!v) return 0;
     if (v->type == T_INT || v->type == T_FLOAT) return 1;
@@ -1906,10 +2125,7 @@ static int val_is_numeric(Value* v) {
         const char* s = v->s ? v->s : "";
         if (!*s) return 0;
 
-        char* end = 0;
-        strtod(s, &end);
-        while (end && isspace((unsigned char)*end)) end++;
-        return end && *end == '\0';
+        return is_numeric_bytes(s, slen(v));
     }
 
     return 0;
@@ -1957,7 +2173,10 @@ static int val_truthy(Value* v) {
         case T_INT: return v->i != 0;
         case T_FLOAT: return v->d != 0.0;
         case T_BOOL: return v->b != 0;
-        case T_STRING: return v->s && v->s[0] && strcmp(v->s, "0") != 0;
+        case T_STRING: {
+            size_t n = slen(v);
+            return n > 1 || (n == 1 && v->s[0] != '0');
+        }
         case T_ARRAY: return v->items != 0;
         default: return 0;
     }
@@ -1973,7 +2192,7 @@ static int val_same(Value* a, Value* b) {
         case T_INT: return a->i == b->i;
         case T_FLOAT: return a->d == b->d;
         case T_BOOL: return a->b == b->b;
-        case T_STRING: return strcmp(a->s ? a->s : "", b->s ? b->s : "") == 0;
+        case T_STRING: return str_cmp_v(a, b) == 0;
         case T_ARRAY: {
             if (array_count(a) != array_count(b)) return 0;
 
@@ -2022,11 +2241,12 @@ static int val_equals(Value* a, Value* b) {
         return val_to_double(a) == val_to_double(b);
 
     if (a->type == T_STRING && b->type == T_STRING)
-        return strcmp(a->s ? a->s : "", b->s ? b->s : "") == 0;
+        return str_cmp_v(a, b) == 0;
 
-    char* sa = val_to_string(a);
-    char* sb = val_to_string(b);
-    int r = strcmp(sa, sb) == 0;
+    size_t na, nb;
+    char* sa = val_bin(a, &na);
+    char* sb = val_bin(b, &nb);
+    int r = na == nb && memcmp(sa, sb, na) == 0;
     free(sa);
     free(sb);
     return r;
@@ -2042,9 +2262,11 @@ static int val_cmp(Value* a, Value* b) {
         return 0;
     }
 
-    char* sa = val_to_string(a);
-    char* sb = val_to_string(b);
-    int r = strcmp(sa, sb);
+    size_t na, nb;
+    char* sa = val_bin(a, &na);
+    char* sb = val_bin(b, &nb);
+    int r = memcmp(sa, sb, na < nb ? na : nb);
+    if (!r) r = na < nb ? -1 : (na > nb ? 1 : 0);
     free(sa);
     free(sb);
 
@@ -2066,15 +2288,16 @@ static long long int_mod(long long x, long long y) {
 
 static Value* arith(int op, Value* a, Value* b) {
     if (op == OP_CONCAT) {
-        char* sa = val_to_string(a);
-        char* sb = val_to_string(b);
-        char* r = concat_str(sa, sb);
+        size_t na, nb;
+        char* sa = val_bin(a, &na);
+        char* sb = val_bin(b, &nb);
+        char* r = malloc(na + nb + 1);
+        memcpy(r, sa, na);
+        memcpy(r + na, sb, nb);
+        r[na + nb] = 0;
         free(sa);
         free(sb);
-
-        Value* v = v_new(T_STRING);
-        v->s = r;
-        return v;
+        return v_str_own(r, na + nb);
     }
 
     if (op == OP_ADD && a && b && a->type == T_ARRAY && b->type == T_ARRAY) {
@@ -2252,7 +2475,7 @@ static void ser_value(Buf* b, Value* v) {
             break;
 
         case T_STRING: {
-            size_t n = strlen(v->s ? v->s : "");
+            size_t n = slen(v);
             buf_fmt(b, "s:%zu:", n);
             buf_add(b, v->s ? v->s : "", n);
             buf_ch(b, '\n');
@@ -2366,6 +2589,7 @@ static Value* parse_ser(const char** pp, const char* end) {
 
         Value* v = v_new(T_STRING);
         v->s = s;
+        v->n = (size_t)len;                 /* zero bytes survive the round trip */
         return v;
     }
 
@@ -2402,14 +2626,14 @@ static Value* parse_ser(const char** pp, const char* end) {
     return v_null();
 }
 
-static void emit_string(const char* s) {
-    if (!s) return;
+static void emit_bytes(const char* p, size_t n) {
+    if (!p || !n) return;
+    if (!cgi_mode) fwrite(p, 1, n, stdout);
+    else buf_add(&response_body, p, n);
+}
 
-    if (!cgi_mode) {
-        fputs(s, stdout);
-    } else {
-        buf_addz(&response_body, s);
-    }
+static void emit_string(const char* s) {
+    if (s) emit_bytes(s, strlen(s));
 }
 
 static void emitf(const char* fmt, ...) {
@@ -2696,11 +2920,12 @@ static void load_session_file(const char* sid) {
     FILE* f = fdopen(fd, "rb");
     if (!f) { close(fd); return; }
 
-    char* data = read_all(f);
+    size_t len = 0;
+    char* data = read_all_n(f, &len);
     fclose(f);
 
     const char* p = data;
-    const char* end = data + strlen(data);
+    const char* end = data + len;   /* not strlen: a value may hold a zero byte */
 
     Value* v = parse_ser(&p, end);
     if (v && v->type == T_ARRAY) {
@@ -2910,13 +3135,12 @@ static void parse_urlencoded_pair(const char* s, size_t len, Value* dest) {
     if (eq) {
         *eq = 0;
 
-        char* k = url_decode(pair);
-        char* v = url_decode(eq + 1);
-
-        register_variable(dest, k, v_str(v));
+        char* k = url_decode(pair);              /* a NAME stops at %00, as in PHP */
+        size_t vn;
+        char* v = url_decode_n(eq + 1, strlen(eq + 1), &vn);
+        register_variable(dest, k, v_str_own(v, vn));   /* the VALUE keeps it */
 
         free(k);
-        free(v);
     } else {
         char* k = url_decode(pair);
         register_variable(dest, k, v_str(""));
@@ -2998,14 +3222,14 @@ static void parse_cookies_into(const char* s, Value* dest) {
             }
 
             char* dk = url_decode(k);
-            char* dv = url_decode(vp);
+            size_t dvn;
+            char* dv = url_decode_n(vp, strlen(vp), &dvn);
 
-            register_variable(dest, dk, v_str(dv));
+            register_variable(dest, dk, v_str_own(dv, dvn));
 
             free(k);
             free(v);
             free(dk);
-            free(dv);
         }
 
         free(pair);
@@ -3543,7 +3767,9 @@ static void dump_value(Value* v, int d) {
             break;
         }
         case T_STRING:
-            emitf("string(%zu) \"%s\"\n", strlen(v->s ? v->s : ""), v->s ? v->s : "");
+            emitf("string(%zu) \"", slen(v));
+            emit_bytes(v->s, slen(v));
+            emit_string("\"\n");
             break;
         case T_ARRAY:
             emitf("array(%d) {\n", array_count(v));
@@ -3551,9 +3777,9 @@ static void dump_value(Value* v, int d) {
                 emit_indent(d + 1);
                 if (it->key && it->key->type == T_INT) emitf("[%lld]=>\n", it->key->i);
                 else {
-                    char* ks = val_to_string(it->key);
-                    emitf("[\"%s\"]=>\n", ks);
-                    free(ks);
+                    emit_string("[\"");
+                    emit_bytes(it->key ? it->key->s : "", it->key ? slen(it->key) : 0);
+                    emit_string("\"]=>\n");
                 }
                 dump_value(it->val, d + 1);
             }
@@ -3577,10 +3803,11 @@ static void pr_render(Buf* b, Value* v, int level) {
         pr_pad(b, level * 8);
         buf_addz(b, "(\n");
         for (ArrayItem* it = v->items; it; it = it->next) {
-            char* ks = val_to_string(it->key);
+            size_t kn;
+            char* ks = val_bin(it->key, &kn);
             pr_pad(b, level * 8 + 4);
             buf_ch(b, '[');
-            buf_addz(b, ks);
+            buf_add(b, ks, kn);
             buf_addz(b, "] => ");
             free(ks);
             pr_render(b, it->val, level + 1);
@@ -3589,8 +3816,9 @@ static void pr_render(Buf* b, Value* v, int level) {
         pr_pad(b, level * 8);
         buf_addz(b, ")\n");
     } else {
-        char* sv = val_to_string(v);
-        buf_addz(b, sv);
+        size_t sn;
+        char* sv = val_bin(v, &sn);
+        buf_add(b, sv, sn);
         free(sv);
     }
 }
@@ -3620,6 +3848,7 @@ static Value* v_str_n(const char* s, size_t n) {
     v->s = malloc(n + 1);
     memcpy(v->s, s, n);
     v->s[n] = 0;
+    v->n = n;
     return v;
 }
 
@@ -3650,44 +3879,58 @@ static int arr_get_bool(Value* arr, const char* key, int def) {
    order, each with the matching replacement (or "" when the replacement array
    runs out, or the one string when replace is a string). An empty search
    string replaces nothing. */
-static char* replace_one(const char* in, const char* from, const char* to) {
-    size_t fl = strlen(from);
-    if (!fl) return xstrdup(in);
+static Value* replace_one(const char* in, size_t inl, const char* from, size_t fl,
+                          const char* to, size_t tl) {
+    if (!fl) return v_str_n(in, inl);
     Buf b;
     buf_init(&b);
-    const char* p = in;
+    size_t p = 0;
     for (;;) {
-        const char* hit = strstr(p, from);
-        if (!hit) { buf_addz(&b, p); break; }
-        buf_add(&b, p, (size_t)(hit - p));
-        buf_addz(&b, to);
-        p = hit + fl;
+        const char* hit = memmem(in + p, inl - p, from, fl);
+        if (!hit) { buf_add(&b, in + p, inl - p); break; }
+        buf_add(&b, in + p, (size_t)(hit - (in + p)));
+        buf_add(&b, to, tl);
+        p = (size_t)(hit - in) + fl;
     }
-    return b.data ? b.data : xstrdup("");
+    size_t n = b.len;
+    return v_str_own(b.data ? b.data : xstrdup(""), n);
 }
 
-static char* str_replace_all(const char* in, Value* search, Value* repl) {
+/* str_replace for one subject. search/replace follow PHP: a string search
+   uses the string replacement; an array of searches is applied in order,
+   each with the matching replacement (or "" when the replacement array runs
+   out, or the one string when replace is a string). An empty search string
+   replaces nothing. Byte strings throughout. */
+static Value* str_replace_all(Value* subject, Value* search, Value* repl) {
+    size_t inl;
+    char* in = val_bin(subject, &inl);
+
     if (search->type != T_ARRAY) {
-        char* from = val_to_string(search);
-        char* to = repl->type == T_ARRAY ? xstrdup("Array") : val_to_string(repl);
-        char* out = replace_one(in, from, to);
+        size_t fl, tl;
+        char* from = val_bin(search, &fl);
+        char* to = repl->type == T_ARRAY ? xstrdup("Array") : val_bin(repl, &tl);
+        if (repl->type == T_ARRAY) tl = 5;
+        Value* out = replace_one(in, inl, from, fl, to, tl);
+        free(in);
         free(from);
         free(to);
         return out;
     }
 
-    char* cur = xstrdup(in);
+    Value* cur = v_str_own(in, inl);
     ArrayItem* r = repl->type == T_ARRAY ? repl->items : 0;
     for (ArrayItem* it = search->items; it; it = it->next) {
-        char* from = val_to_string(it->val);
+        size_t fl, tl;
+        char* from = val_bin(it->val, &fl);
         char* to;
-        if (repl->type == T_ARRAY) { to = r ? val_to_string(r->val) : xstrdup(""); if (r) r = r->next; }
-        else to = val_to_string(repl);
-        char* next = replace_one(cur, from, to);
-        free(cur);
+        if (repl->type == T_ARRAY) {
+            if (r) { to = val_bin(r->val, &tl); r = r->next; } else { to = xstrdup(""); tl = 0; }
+        } else {
+            to = val_bin(repl, &tl);
+        }
+        cur = replace_one(cur->s, slen(cur), from, fl, to, tl);
         free(from);
         free(to);
-        cur = next;
     }
     return cur;
 }
@@ -3769,7 +4012,7 @@ static int sq_bind(sqlite3* db, sqlite3_stmt* st, Value* params, const char* fn)
         else if (v->type == T_INT)    rc = sqlite3_bind_int64(st, idx, v->i);
         else if (v->type == T_BOOL)   rc = sqlite3_bind_int64(st, idx, v->b ? 1 : 0);
         else if (v->type == T_FLOAT)  rc = sqlite3_bind_double(st, idx, v->d);
-        else if (v->type == T_STRING) rc = sqlite3_bind_text(st, idx, v->s ? v->s : "", -1, SQLITE_TRANSIENT);
+        else if (v->type == T_STRING) rc = sqlite3_bind_text(st, idx, v->s ? v->s : "", (int)slen(v), SQLITE_TRANSIENT);
         else {
             fprintf(stderr, "PHP warning: %s(): an array cannot be bound as a parameter\n", fn);
             return 0;
@@ -3832,6 +4075,8 @@ static Value* sqlite_builtin(const char* name, Value** args, int argc, int* hand
 
     if (!strcmp(name, "sqlite_open")) {
         SQNEED(1);
+        if (has_nul(args[0]))
+            fatal("Uncaught ValueError: sqlite_open(): Argument #1 ($filename) must not contain any null bytes");
         if (sq_count >= MAX_SQLITE_HANDLES) {
             fprintf(stderr, "PHP warning: sqlite_open(): too many databases opened in one request\n");
             return v_bool(0);
@@ -3956,10 +4201,10 @@ static Value* builtin(const char* name, Value** args, int argc) {
 
     if (!strcmp(name, "strlen")) {
         NEED(1);
-        char* s = val_to_string(args[0]);
-        long long l = (long long)strlen(s);
+        size_t n;
+        char* s = val_bin(args[0], &n);          /* bytes, zeros included */
         free(s);
-        return v_int(l);
+        return v_int((long long)n);
     }
 
     if (!strcmp(name, "count")) {
@@ -3972,6 +4217,8 @@ static Value* builtin(const char* name, Value** args, int argc) {
 
     if (!strcmp(name, "is_uploaded_file")) {
         NEED(1);
+        if (has_nul(args[0]))
+            fatal("Uncaught ValueError: is_uploaded_file(): Argument #1 ($filename) must not contain any null bytes");
         char* path = val_to_string(args[0]);
         int ok = find_upload(path) >= 0;
         free(path);
@@ -3980,6 +4227,11 @@ static Value* builtin(const char* name, Value** args, int argc) {
 
     if (!strcmp(name, "move_uploaded_file")) {
         NEED(2);
+        /* PHP's split: $to is a path and a zero byte in it is an error;
+           $from is matched against this request's uploads, so it just fails */
+        if (has_nul(args[1]))
+            fatal("Uncaught ValueError: move_uploaded_file(): Argument #2 ($to) must not contain any null bytes");
+        if (has_nul(args[0])) return v_bool(0);
         /* Only a file that arrived in THIS request -- anything else is
            refused with false and no warning, exactly as PHP does. */
         char* from = val_to_string(args[0]);
@@ -4026,8 +4278,8 @@ static Value* builtin(const char* name, Value** args, int argc) {
         /* POSIX basename as PHP does it on Linux: trailing slashes dropped,
            the last component kept, and an optional suffix removed unless
            it is the whole name. */
-        char* path = val_to_string(args[0]);
-        size_t n = strlen(path);
+        size_t n;
+        char* path = val_bin(args[0], &n);       /* a pure string function: bytes */
         while (n > 1 && path[n - 1] == '/') n--;
         if (n == 1 && path[0] == '/') n = 0;
         size_t st = n;
@@ -4044,6 +4296,65 @@ static Value* builtin(const char* name, Value** args, int argc) {
         return r;
     }
 
+    /* ---------- binary data (binary-safe strings) ---------- */
+
+    if (!strcmp(name, "chr")) {
+        NEED(1);
+        long long c = val_to_int(args[0]) % 256;        /* PHP 8: wraps, negatives too */
+        if (c < 0) c += 256;
+        char b = (char)c;
+        return v_str_n(&b, 1);
+    }
+
+    if (!strcmp(name, "ord")) {
+        NEED(1);
+        size_t n;
+        char* p = val_bin(args[0], &n);
+        long long r = n ? (unsigned char)p[0] : 0;
+        free(p);
+        return v_int(r);
+    }
+
+    if (!strcmp(name, "bin2hex")) {
+        NEED(1);
+        size_t n;
+        char* p = val_bin(args[0], &n);
+        char* h = malloc(n * 2 + 1);
+        static const char hx[] = "0123456789abcdef";
+        for (size_t i = 0; i < n; i++) {
+            h[2 * i] = hx[(unsigned char)p[i] >> 4];
+            h[2 * i + 1] = hx[(unsigned char)p[i] & 15];
+        }
+        h[n * 2] = 0;
+        free(p);
+        return v_str_own(h, n * 2);
+    }
+
+    if (!strcmp(name, "hex2bin")) {
+        NEED(1);
+        size_t n;
+        char* p = val_bin(args[0], &n);
+        if (n % 2) {
+            fprintf(stderr, "PHP warning: hex2bin(): Hexadecimal input string must have an even length\n");
+            free(p);
+            return v_bool(0);
+        }
+        char* out = malloc(n / 2 + 1);
+        for (size_t i = 0; i < n; i += 2) {
+            int hi = hexval(p[i]), lo = hexval(p[i + 1]);
+            if (hi < 0 || lo < 0) {
+                fprintf(stderr, "PHP warning: hex2bin(): Input string must be hexadecimal string\n");
+                free(p);
+                free(out);
+                return v_bool(0);
+            }
+            out[i / 2] = (char)(hi * 16 + lo);
+        }
+        out[n / 2] = 0;
+        free(p);
+        return v_str_own(out, n / 2);
+    }
+
     /* ---------- strings (milestone 2) ----------
        Each follows PHP 8's rules, including its errors: where PHP 8 throws a
        ValueError the call is a fatal error here, since this runtime has no
@@ -4051,8 +4362,9 @@ static Value* builtin(const char* name, Value** args, int argc) {
 
     if (!strcmp(name, "substr")) {
         NEED(2);
-        char* str = val_to_string(args[0]);
-        long long len = (long long)strlen(str);
+        size_t sl;
+        char* str = val_bin(args[0], &sl);
+        long long len = (long long)sl;
         long long start = val_to_int(args[1]);
         long long cnt = (argc > 2 && args[2]->type != T_NULL) ? val_to_int(args[2]) : len;
 
@@ -4066,56 +4378,55 @@ static Value* builtin(const char* name, Value** args, int argc) {
         free(str);
         return r;
     }
-
     if (!strcmp(name, "strpos")) {
         NEED(2);
-        char* hay = val_to_string(args[0]);
-        char* ndl = val_to_string(args[1]);
-        long long hl = (long long)strlen(hay);
+        size_t hl_, nl;
+        char* hay = val_bin(args[0], &hl_);
+        char* ndl = val_bin(args[1], &nl);
+        long long hl = (long long)hl_;
         long long off = argc > 2 ? val_to_int(args[2]) : 0;
 
         if (off < 0) off += hl;
         if (off < 0 || off > hl)
             fatal("strpos(): Argument #3 ($offset) must be contained in argument #1 ($haystack)");
 
-        char* hit = strstr(hay + off, ndl);         /* "" matches at off, as PHP 8 */
+        /* memmem, not strstr: a zero byte in either string is just a byte */
+        char* hit = nl ? memmem(hay + off, (size_t)(hl - off), ndl, nl) : hay + off;
         Value* r = hit ? v_int((long long)(hit - hay)) : v_bool(0);
         free(hay);
         free(ndl);
         return r;
     }
-
     if (!strcmp(name, "str_repeat")) {
         NEED(2);
-        char* str = val_to_string(args[0]);
+        size_t sl;
+        char* str = val_bin(args[0], &sl);
         long long times = val_to_int(args[1]);
         if (times < 0)
             fatal("str_repeat(): Argument #2 ($times) must be greater than or equal to 0");
 
-        size_t sl = strlen(str);
         /* sl * times can overflow size_t; refuse rather than allocate a wrap-
            around size and write past it. (Real sizes stop at memory_limit.) */
         if (sl && (unsigned long long)times > (SIZE_MAX - 1) / sl)
             fatal("str_repeat(): result is too big");
 
         size_t total = sl * (size_t)times;
-        Value* r = v_new(T_STRING);
-        r->s = malloc(total + 1);
-        for (long long i = 0; i < times; i++) memcpy(r->s + (size_t)i * sl, str, sl);
-        r->s[total] = 0;
+        char* out = malloc(total + 1);
+        for (long long i = 0; i < times; i++) memcpy(out + (size_t)i * sl, str, sl);
+        out[total] = 0;
         free(str);
-        return r;
+        return v_str_own(out, total);
     }
-
     if (!strcmp(name, "trim") || !strcmp(name, "ltrim") || !strcmp(name, "rtrim")) {
         NEED(1);
-        char* str = val_to_string(args[0]);
+        size_t z;
+        char* str = val_bin(args[0], &z);
         unsigned char strip[256] = {0};
 
         if (argc > 1) {
             /* the character list, including PHP's "a..z" ranges */
-            char* cl = val_to_string(args[1]);
-            size_t n = strlen(cl);
+            size_t n;
+            char* cl = val_bin(args[1], &n);
             for (size_t i = 0; i < n; i++) {
                 unsigned char c0 = (unsigned char)cl[i];
                 if (i + 3 < n && cl[i + 1] == '.' && cl[i + 2] == '.' &&
@@ -4133,7 +4444,7 @@ static Value* builtin(const char* name, Value** args, int argc) {
             strip[0] = 1;
         }
 
-        size_t a = 0, z = strlen(str);
+        size_t a = 0;
         if (strcmp(name, "rtrim")) while (a < z && strip[(unsigned char)str[a]]) a++;
         if (strcmp(name, "ltrim")) while (z > a && strip[(unsigned char)str[z - 1]]) z--;
 
@@ -4141,34 +4452,33 @@ static Value* builtin(const char* name, Value** args, int argc) {
         free(str);
         return r;
     }
-
     if (!strcmp(name, "explode")) {
         NEED(2);
-        char* sep = val_to_string(args[0]);
-        char* str = val_to_string(args[1]);
+        size_t sepl, sl;
+        char* sep = val_bin(args[0], &sepl);
+        char* str = val_bin(args[1], &sl);
         long long limit = argc > 2 ? val_to_int(args[2]) : LLONG_MAX;
-        size_t sepl = strlen(sep);
 
         if (!sepl) fatal("explode(): Argument #1 ($separator) cannot be empty");
         if (limit == 0) limit = 1;
 
         /* split everything first; the limit rules are easier on the list */
         size_t np = 0, cap = 8;
-        const char** starts = malloc(cap * sizeof *starts);
+        size_t* starts = malloc(cap * sizeof *starts);
         size_t* lens = malloc(cap * sizeof *lens);
-        const char* p = str;
+        size_t p = 0;
         for (;;) {
-            const char* hit = strstr(p, sep);
+            char* hit = memmem(str + p, sl - p, sep, sepl);
             if (np == cap) {
                 cap *= 2;
                 starts = realloc(starts, cap * sizeof *starts);
                 lens = realloc(lens, cap * sizeof *lens);
             }
             starts[np] = p;
-            lens[np] = hit ? (size_t)(hit - p) : strlen(p);
+            lens[np] = hit ? (size_t)(hit - (str + p)) : sl - p;
             np++;
             if (!hit) break;
-            p = hit + sepl;
+            p = (size_t)(hit - str) + sepl;
         }
 
         ArrBuild ab;
@@ -4177,12 +4487,12 @@ static Value* builtin(const char* name, Value** args, int argc) {
             size_t keep = (size_t)limit < np ? (size_t)limit : np;
             for (size_t i = 0; i < keep; i++) {
                 /* the last kept piece runs to the end of the string */
-                size_t l = (i + 1 == keep && keep < np) ? strlen(starts[i]) : lens[i];
-                ab_push(&ab, v_str_n(starts[i], l));
+                size_t l = (i + 1 == keep && keep < np) ? sl - starts[i] : lens[i];
+                ab_push(&ab, v_str_n(str + starts[i], l));
             }
         } else {
             long long keep = (long long)np + limit;   /* drop the last -limit */
-            for (long long i = 0; i < keep; i++) ab_push(&ab, v_str_n(starts[i], lens[i]));
+            for (long long i = 0; i < keep; i++) ab_push(&ab, v_str_n(str + starts[i], lens[i]));
         }
 
         free(starts);
@@ -4191,37 +4501,37 @@ static Value* builtin(const char* name, Value** args, int argc) {
         free(str);
         return ab.arr;
     }
-
     if (!strcmp(name, "implode") || !strcmp(name, "join")) {
         NEED(1);
         Value* arr;
         char* glue;
+        size_t gl;
         if (argc == 1) {
             if (args[0]->type != T_ARRAY)
                 fatal("implode(): Argument #1 ($array) must be of type array");
             arr = args[0];
             glue = xstrdup("");
+            gl = 0;
         } else {
             if (args[1]->type != T_ARRAY)
                 fatal("implode(): Argument #2 ($array) must be of type ?array");
             arr = args[1];
-            glue = val_to_string(args[0]);
+            glue = val_bin(args[0], &gl);
         }
 
         Buf b;
         buf_init(&b);
         for (ArrayItem* it = arr->items; it; it = it->next) {
-            if (it != arr->items) buf_addz(&b, glue);
-            char* part = val_to_string(it->val);
-            buf_addz(&b, part);
+            if (it != arr->items) buf_add(&b, glue, gl);
+            size_t pl;
+            char* part = val_bin(it->val, &pl);
+            buf_add(&b, part, pl);
             free(part);
         }
         free(glue);
-        Value* r = v_new(T_STRING);
-        r->s = b.data ? b.data : xstrdup("");
-        return r;
+        size_t total = b.len;
+        return v_str_own(b.data ? b.data : xstrdup(""), total);
     }
-
     if (!strcmp(name, "str_replace")) {
         NEED(3);
         /* search and replace may each be a string or an array, and the
@@ -4233,24 +4543,12 @@ static Value* builtin(const char* name, Value** args, int argc) {
         if (subj->type == T_ARRAY) {
             ArrBuild ab;
             ab_init(&ab);
-            for (ArrayItem* it = subj->items; it; it = it->next) {
-                char* in = val_to_string(it->val);
-                char* out = str_replace_all(in, search, repl);
-                free(in);
-                Value* v = v_new(T_STRING);
-                v->s = out;
-                ab_put(&ab, val_clone(it->key), v);
-            }
+            for (ArrayItem* it = subj->items; it; it = it->next)
+                ab_put(&ab, val_clone(it->key), str_replace_all(it->val, search, repl));
             return ab.arr;
         }
-
-        char* in = val_to_string(subj);
-        Value* r = v_new(T_STRING);
-        r->s = str_replace_all(in, search, repl);
-        free(in);
-        return r;
+        return str_replace_all(subj, search, repl);
     }
-
     /* ---------- arrays (milestone 2) ---------- */
 
     if (!strcmp(name, "in_array")) {
@@ -4313,24 +4611,20 @@ static Value* builtin(const char* name, Value** args, int argc) {
 
     if (!strcmp(name, "strtoupper")) {
         NEED(1);
-        char* s = val_to_string(args[0]);
-        char* u = case_dup(s, 1);
+        size_t n;
+        char* s = val_bin(args[0], &n);
+        char* r = case_dup_n(s, n, 1);
         free(s);
-
-        Value* v = v_new(T_STRING);
-        v->s = u;
-        return v;
+        return v_str_own(r, n);
     }
 
     if (!strcmp(name, "strtolower")) {
         NEED(1);
-        char* s = val_to_string(args[0]);
-        char* l = case_dup(s, 0);
+        size_t n;
+        char* s = val_bin(args[0], &n);
+        char* r = case_dup_n(s, n, 0);
         free(s);
-
-        Value* v = v_new(T_STRING);
-        v->s = l;
-        return v;
+        return v_str_own(r, n);
     }
 
     if (!strcmp(name, "abs")) {
@@ -4414,11 +4708,10 @@ static Value* builtin(const char* name, Value** args, int argc) {
         buf_init(&b);
         pr_render(&b, args[0], 0);
         if (argc > 1 && val_truthy(args[1])) {
-            Value* r = v_new(T_STRING);
-            r->s = b.data ? b.data : xstrdup("");
-            return r;
+            size_t bn = b.len;
+            return v_str_own(b.data ? b.data : xstrdup(""), bn);
         }
-        if (b.data) emit_string(b.data);
+        if (b.data) emit_bytes(b.data, b.len);
         free(b.data);
         return v_bool(1);
     }
@@ -4492,6 +4785,12 @@ static Value* builtin(const char* name, Value** args, int argc) {
     if (!strcmp(name, "header")) {
         NEED(1);
 
+        /* a zero byte would cut the header short on the C side; PHP refuses
+           the whole header with this warning, and so does this */
+        if (has_nul(args[0])) {
+            fprintf(stderr, "PHP warning: Header may not contain NUL bytes\n");
+            return v_null();
+        }
         char* line = val_to_string(args[0]);
         int replace = 1;
         int code = 0;
@@ -4561,37 +4860,32 @@ static Value* builtin(const char* name, Value** args, int argc) {
         return v_bool(1);
     }
 
-    if (!strcmp(name, "urlencode")) {
+    if (!strcmp(name, "urlencode") || !strcmp(name, "rawurlencode")) {
         NEED(1);
-        char* s = val_to_string(args[0]);
-        char* e = url_encode(s);
+        size_t n;
+        char* s = val_bin(args[0], &n);
+        char* e = url_encode_n(s, n, name[0] == 'r');   /* a zero byte becomes %00 */
         free(s);
-
-        Value* v = v_new(T_STRING);
-        v->s = e;
-        return v;
+        return v_str_own(e, strlen(e));         /* encoded output has no zero bytes */
     }
 
-    if (!strcmp(name, "urldecode")) {
+    if (!strcmp(name, "urldecode") || !strcmp(name, "rawurldecode")) {
         NEED(1);
-        char* s = val_to_string(args[0]);
-        char* d = url_decode(s);
+        size_t n, dn;
+        char* s = val_bin(args[0], &n);
+        /* %00 becomes a zero byte; only urldecode() turns "+" into a space */
+        char* d = url_decode_raw(s, n, &dn, name[0] != 'r');
         free(s);
-
-        Value* v = v_new(T_STRING);
-        v->s = d;
-        return v;
+        return v_str_own(d, dn);
     }
 
     if (!strcmp(name, "htmlspecialchars")) {
         NEED(1);
-        char* s = val_to_string(args[0]);
-        char* h = html_escape(s);
+        size_t n, hn;
+        char* s = val_bin(args[0], &n);
+        char* h = html_escape_n(s, n, &hn);
         free(s);
-
-        Value* v = v_new(T_STRING);
-        v->s = h;
-        return v;
+        return v_str_own(h, hn);
     }
 
     if (!strcmp(name, "php_sapi_name")) {
@@ -4614,16 +4908,12 @@ static Value* eval_index(Value* cont, Value* key) {
 
     if (cont->type == T_STRING) {
         long long idx = val_to_int(key);
-        size_t len = strlen(cont->s ? cont->s : "");
+        size_t len = slen(cont);
 
         if (idx < 0) idx += (long long)len;
         if (idx < 0 || idx >= (long long)len) return v_str("");
 
-        char buf[2];
-        buf[0] = cont->s[idx];
-        buf[1] = 0;
-
-        return v_str(buf);
+        return v_str_n(cont->s + idx, 1);          /* a zero byte is a byte */
     }
 
     return v_null();
@@ -4644,14 +4934,18 @@ static void set_index(Value* cont, Value* key, Value* val) {
 
     if (cont->type == T_STRING) {
         long long idx = val_to_int(key);
-        size_t len = strlen(cont->s ? cont->s : "");
+        size_t len = slen(cont);
 
         if (idx < 0) idx += (long long)len;
         if (idx < 0 || idx >= (long long)len) fatal("Illegal string offset");
 
-        char* tmp = val_to_string(val);
-        if (tmp[0]) cont->s[idx] = tmp[0];
-        else cont->s[idx] = '\0';
+        size_t tl;
+        char* tmp = val_bin(val, &tl);
+        /* PHP 8: assigning "" to an offset is an error. It used to write a
+           zero byte, which with binary-safe strings would silently put a
+           NUL into the middle of the string. */
+        if (!tl) { free(tmp); fatal("Cannot assign an empty string to a string offset"); }
+        cont->s[idx] = tmp[0];
         free(tmp);
 
         return;
@@ -4672,7 +4966,7 @@ static Value* eval(Node* n, Env* env) {
             return v_float(n->d);
 
         case NT_STR:
-            return v_str(n->s);
+            return n->n ? v_str_n(n->s, n->n) : v_str(n->s);
 
         case NT_BOOL:
             return v_bool((int)n->i);
@@ -4950,15 +5244,18 @@ static NodeList* parse_file_at(const char* real, char* code) {
 static Value* do_include(Node* n, Env* env) {
     int once = n->i & 1, req = n->i & 2;
     const char* what = req ? (once ? "require_once" : "require") : (once ? "include_once" : "include");
-    char* path = val_to_string(eval(n->a, env));
-    char* found = resolve_include(path, n->s);
+    Value* pv = eval(n->a, env);
+    char* path = val_to_string(pv);
+    /* "secret\0.php" must not open "secret" -- PHP refuses it the same way */
+    char* found = has_nul(pv) ? 0 : resolve_include(path, n->s);
 
     if (!found) {
         const char* ip = getenv("PHPMINI_INCLUDE_PATH");
         if (!ip || !*ip) ip = ".";
         /* include warns and carries on with false; require stops -- PHP's
            split, and its wording */
-        fprintf(stderr, "PHP warning: %s(%s): Failed to open stream: No such file or directory\n", what, path);
+        if (!has_nul(pv))   /* PHP never tries to open a path with a zero byte */
+            fprintf(stderr, "PHP warning: %s(%s): Failed to open stream: No such file or directory\n", what, path);
         if (req) fatal("Uncaught Error: Failed opening required '%s' (include_path='%s')", path, ip);
         fprintf(stderr, "PHP warning: %s(): Failed opening '%s' for inclusion (include_path='%s')\n", what, path, ip);
         free(path);
@@ -5066,8 +5363,9 @@ static void exec(Node* n, Env* env) {
         case NT_ECHO:
             for (NodeList* l = n->l1; l; l = l->next) {
                 Value* v = eval(l->node, env);
-                char* s = val_to_string(v);
-                emit_string(s);
+                size_t n;
+                char* s = val_bin(v, &n);          /* every byte, zeros too */
+                emit_bytes(s, n);
                 free(s);
             }
             break;
