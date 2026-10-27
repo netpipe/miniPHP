@@ -14,6 +14,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <limits.h>
+#include <errno.h>
 #include <sys/types.h>
 #include <fcntl.h>
 
@@ -141,6 +142,7 @@ static int cgi_mode = 0;
 
 static Value *V_GET = 0;
 static Value *V_POST = 0;
+static Value *V_FILES = 0;
 static Value *V_COOKIE = 0;
 static Value *V_SESSION = 0;
 static Value *V_SERVER = 0;
@@ -273,6 +275,8 @@ static void exec(Node* n, Env* env);
 static void exec_list(NodeList* l, Env* env);
 static void assign_to(Node* target, Value* val, Env* env);
 static long long array_next_index(Value* arr);
+static long long double_to_ll(double d);
+static Value* v_str_n(const char* s, size_t n);
 static Value* call_user(Func* f, Value** args, int argc);
 static Value* builtin(const char* name, Value** args, int argc);
 
@@ -1643,13 +1647,31 @@ static Value* normalize_key(Value* k) {
     switch (k->type) {
         case T_INT: return v_int(k->i);
         case T_BOOL: return v_int(k->b);
-        case T_FLOAT: return v_int((long long)k->d);
+        case T_FLOAT: return v_int(double_to_ll(k->d));
         case T_NULL: return v_str("");
         case T_STRING: {
+            /* PHP turns a string key into an integer only when it is the
+               CANONICAL form of one: "0", or an optional "-" then a digit
+               1-9 then digits, and it fits in 64 bits. strtoll accepted
+               more, so "05", " 5" and "+5" all became 5 and overwrote each
+               other -- a zip code "05" and an id "5" were the same key, and
+               "99999999999999999999" landed on PHP_INT_MAX. */
             const char* s = k->s ? k->s : "";
-            char* end = 0;
-            long long iv = strtoll(s, &end, 10);
-            if (end != s && *end == '\0') return v_int(iv);
+            const char* p = s;
+            int canonical = 0;
+            if (*p == '-') p++;
+            if (p[0] == '0' && p[1] == 0 && p == s) canonical = 1;          /* "0" */
+            else if (*p >= '1' && *p <= '9') {
+                const char* q = p;
+                while (*q >= '0' && *q <= '9') q++;
+                canonical = (*q == 0) && (q - p) <= 19;
+            }
+            if (canonical) {
+                errno = 0;
+                char* end = 0;
+                long long iv = strtoll(s, &end, 10);
+                if (errno == 0 && end && *end == 0) return v_int(iv);  /* fits */
+            }
             return v_str(s);
         }
         default:
@@ -2745,6 +2767,84 @@ static char* trim_dup(const char* s, size_t n) {
     return r;
 }
 
+/* PHP's form-variable registration (php_register_variable_ex), shared by
+   the query string, form bodies, cookies and $_FILES:
+     - leading spaces are dropped; in the base name ' ' and '.' become '_'
+     - a[b][c] nests, a[] appends, a[][x] appends an array and fills it
+     - an unmatched '[' turns into '_' and the rest is a plain name
+       ("e[" -> "e_", "f[x" -> "f_x"); text after a closing ']' that is not
+       another '[' is ignored ("a[b]c" -> a[b])
+     - a scalar met where an array is needed is replaced by the array
+     - nesting deeper than 64 drops the variable (max_input_nesting_level)
+   Before this, "opts[]" from a checkbox list or "files[]" from a multi-file
+   input arrived as a single key literally named "opts[]". Checked against
+   PHP's own parse_str(), which uses the same code as $_GET. */
+static void register_variable(Value* dest, const char* raw, Value* val) {
+    while (*raw == ' ') raw++;
+    char* var = xstrdup(raw);
+    char* p = var;
+    char* ip = 0;
+
+    for (; *p; p++) {
+        if (*p == ' ' || *p == '.') *p = '_';
+        else if (*p == '[') { ip = p; *p = 0; break; }
+    }
+    if (!var[0]) { free(var); return; }          /* empty name: dropped */
+
+    Value* table = dest;
+    char* index = var;                           /* NULL means "append" */
+    int nest = 0;
+
+    while (ip) {
+        if (++nest > 64) { free(var); return; }
+        ip++;
+        char* index_s = ip;
+        if (*ip == ' ') ip++;
+        if (*ip == ']') {
+            index_s = 0;
+        } else {
+            char* close = strchr(ip, ']');
+            if (!close) {
+                /* not an index after all: un-terminate and treat as a name */
+                *(index_s - 1) = '_';
+                for (char* q = index_s; *q; q++)
+                    if (*q == ' ' || *q == '.' || *q == '[') *q = '_';
+                ip = 0;
+                break;
+            }
+            ip = close;
+            *ip = 0;
+        }
+
+        /* descend into (or create) the array at the CURRENT index */
+        Value* next;
+        if (!index) {
+            next = v_new(T_ARRAY);
+            array_put(table, v_int(array_next_index(table)), next);
+        } else {
+            Value* key = normalize_key(v_str(index));
+            ArrayItem* it = array_find(table, key);
+            if (!it) {
+                next = v_new(T_ARRAY);
+                array_put(table, key, next);
+            } else {
+                if (!it->val || it->val->type != T_ARRAY) it->val = v_new(T_ARRAY);
+                next = it->val;
+            }
+        }
+        table = next;
+        index = index_s;
+
+        ip++;
+        if (*ip == '[') { *ip = 0; continue; }  /* another level */
+        ip = 0;                                  /* anything else is ignored */
+    }
+
+    if (!index) array_put(table, v_int(array_next_index(table)), val);
+    else array_put(table, normalize_key(v_str(index)), val);
+    free(var);
+}
+
 static void parse_urlencoded_pair(const char* s, size_t len, Value* dest) {
     char* pair = malloc(len + 1);
     if (!pair) fatal("out of memory");
@@ -2760,13 +2860,13 @@ static void parse_urlencoded_pair(const char* s, size_t len, Value* dest) {
         char* k = url_decode(pair);
         char* v = url_decode(eq + 1);
 
-        if (*k) array_put(dest, v_str(k), v_str(v));
+        register_variable(dest, k, v_str(v));
 
         free(k);
         free(v);
     } else {
         char* k = url_decode(pair);
-        if (*k) array_put(dest, v_str(k), v_str(""));
+        register_variable(dest, k, v_str(""));
         free(k);
     }
 
@@ -2847,7 +2947,7 @@ static void parse_cookies_into(const char* s, Value* dest) {
             char* dk = url_decode(k);
             char* dv = url_decode(vp);
 
-            if (*dk) array_put(dest, v_str(dk), v_str(dv));
+            register_variable(dest, dk, v_str(dv));
 
             free(k);
             free(v);
@@ -2891,23 +2991,375 @@ static void fill_server_globals(void) {
     add_server_str("GATEWAY_INTERFACE", cgi_mode ? "CGI/1.1" : "");
 }
 
+/* ---------- request body: forms and file uploads (milestone 4) ---------- */
+
+/* A size from the environment, in PHP's ini style: "8M", "512K", "1G", or
+   plain bytes. 0 or negative means "no limit". */
+static long long env_size(const char* name, long long def) {
+    const char* e = getenv(name);
+    if (!e || !*e) return def;
+    char* end = 0;
+    long long v = strtoll(e, &end, 10);
+    if (end && (*end == 'k' || *end == 'K')) v <<= 10;
+    else if (end && (*end == 'm' || *end == 'M')) v <<= 20;
+    else if (end && (*end == 'g' || *end == 'G')) v <<= 30;
+    return v;
+}
+
+/* The files that arrived in THIS request. is_uploaded_file() and
+   move_uploaded_file() accept a path only if it is in this list -- that is
+   the whole of their security: it is what stops a script being tricked
+   into "moving" /etc/passwd or its own config somewhere public, because the
+   path came from the visitor. Anything not moved is deleted at exit. */
+#define MAX_UPLOADS_TRACKED 1024
+static char* up_path[MAX_UPLOADS_TRACKED];
+static int up_moved[MAX_UPLOADS_TRACKED];
+static int up_count = 0;
+
+static int find_upload(const char* path) {
+    for (int i = 0; i < up_count; i++)
+        if (!up_moved[i] && up_path[i] && !strcmp(up_path[i], path)) return i;
+    return -1;
+}
+
+static void cleanup_uploads(void) {
+    for (int i = 0; i < up_count; i++)
+        if (!up_moved[i] && up_path[i]) unlink(up_path[i]);
+    up_count = 0;
+}
+
+/* PHP's UPLOAD_ERR_* codes, same values. */
+#define UPLOAD_ERR_OK         0
+#define UPLOAD_ERR_INI_SIZE   1
+#define UPLOAD_ERR_FORM_SIZE  2
+#define UPLOAD_ERR_PARTIAL    3
+#define UPLOAD_ERR_NO_FILE    4
+#define UPLOAD_ERR_NO_TMP_DIR 6
+#define UPLOAD_ERR_CANT_WRITE 7
+
+/* The name a visitor sent is cut to its last path component -- both '/' and
+   '\\', because old Windows browsers send "C:\\Users\\me\\photo.jpg".
+   So "../../shell.php" arrives as "shell.php", and a script that does
+   move_uploaded_file($f["tmp_name"], "uploads/" . $f["name"]) cannot be
+   steered out of uploads/. (Which file TYPES to accept is still the
+   script's decision, as in PHP.) */
+static const char* upload_basename(const char* s) {
+    const char* b = s;
+    for (const char* p = s; *p; p++) if (*p == '/' || *p == '\\') b = p + 1;
+    return b;
+}
+
+/* $_FILES["f"]["name"] for "f", $_FILES["f"]["name"][0] for "f[]" -- PHP
+   builds the attribute into the name and lets the normal registration
+   nest it, which is why multi-file inputs come out "transposed". */
+static void register_file_attr(const char* field, const char* attr, Value* val) {
+    const char* br = strchr(field, '[');
+    size_t base = br ? (size_t)(br - field) : strlen(field);
+    Buf b;
+    buf_init(&b);
+    buf_add(&b, field, base);
+    buf_ch(&b, '[');
+    buf_addz(&b, attr);
+    buf_ch(&b, ']');
+    if (br) buf_addz(&b, br);
+    register_variable(V_FILES, b.data, val);
+    free(b.data);
+}
+
+static void register_file(const char* field, const char* sent_name, const char* type,
+                          const char* tmp, int err, long long size) {
+    register_file_attr(field, "name", v_str(upload_basename(sent_name)));
+    register_file_attr(field, "full_path", v_str(sent_name));
+    register_file_attr(field, "type", v_str(type));
+    register_file_attr(field, "tmp_name", v_str(tmp));
+    register_file_attr(field, "error", v_int(err));
+    register_file_attr(field, "size", v_int(size));
+}
+
+/* Store one uploaded file's bytes in a fresh temp file. mkstemp() creates
+   it 0600 under a name nobody can predict, so another account on the
+   machine can neither read it nor pre-plant something at that path. */
+static int store_upload(const char* data, size_t len, char* out, size_t outsz) {
+    const char* dir = getenv("PHPMINI_UPLOAD_TMP_DIR");
+    if (!dir || !*dir) dir = getenv("TMPDIR");
+    if (!dir || !*dir) dir = "/tmp";
+
+    struct stat st;
+    if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) return UPLOAD_ERR_NO_TMP_DIR;
+    if (up_count >= MAX_UPLOADS_TRACKED) return UPLOAD_ERR_CANT_WRITE;
+
+    snprintf(out, outsz, "%s/phpXXXXXX", dir);
+    int fd = mkstemp(out);
+    if (fd < 0) return UPLOAD_ERR_CANT_WRITE;
+
+    size_t done = 0;
+    while (done < len) {
+        ssize_t w = write(fd, data + done, len - done);
+        if (w <= 0) { close(fd); unlink(out); return UPLOAD_ERR_CANT_WRITE; }
+        done += (size_t)w;
+    }
+    close(fd);
+
+    up_path[up_count] = xstrdup(out);
+    up_moved[up_count] = 0;
+    up_count++;
+    return UPLOAD_ERR_OK;
+}
+
+/* One parameter of a header like
+     Content-Disposition: form-data; name="f"; filename="a b.txt"
+   Quoted values may contain ';' and backslash-escaped characters. The
+   match is on the whole parameter NAME, so asking for "name" does not
+   find the tail of "filename". Returns a malloc'd value or NULL. */
+static char* header_param(const char* h, const char* want) {
+    size_t wl = strlen(want);
+    const char* p = strchr(h, ';');
+    while (p) {
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+        const char* eq = p;
+        while (*eq && *eq != '=' && *eq != ';') eq++;
+        size_t kl = (size_t)(eq - p);
+        while (kl && (p[kl - 1] == ' ' || p[kl - 1] == '\t')) kl--;
+
+        int hit = (kl == wl && !strncasecmp(p, want, wl));
+        const char* v = (*eq == '=') ? eq + 1 : eq;
+        while (*v == ' ' || *v == '\t') v++;
+
+        Buf b;
+        buf_init(&b);
+        const char* next;
+        if (*eq == '=' && (*v == '"' || *v == '\'')) {
+            /* PHP's rule (substring_conf): a quoted value may use " or ',
+               and a backslash escapes ONLY a backslash or the quote. Any
+               other backslash is kept, so "C:\Users\me\a.jpg" from an old
+               Windows browser survives intact -- unescaping every backslash
+               turned it into "C:Usersmea.jpg". */
+            char quote = *v;
+            const char* q = v + 1;
+            while (*q && *q != quote) {
+                if (*q == '\\' && (q[1] == '\\' || q[1] == quote)) q++;
+                buf_ch(&b, *q++);
+            }
+            next = *q ? strchr(q + 1, ';') : 0;
+        } else {
+            const char* q = v;
+            while (*q && *q != ';') q++;
+            size_t vl = (size_t)(q - v);
+            while (vl && (v[vl - 1] == ' ' || v[vl - 1] == '\t')) vl--;
+            if (*eq == '=') buf_add(&b, v, vl);
+            next = *q ? q : 0;
+        }
+        if (hit) return b.data ? b.data : xstrdup("");
+        free(b.data);
+        p = next;
+    }
+    return 0;
+}
+
+/* boundary=... from the Content-Type, quoted or bare, as PHP reads it.
+   0 if missing or unusable (RFC 2046 caps it at 70; anything over 200 is
+   refused rather than searched for in every body). */
+static int multipart_boundary(const char* ct, char* out, size_t outsz) {
+    const char* b = strcasestr(ct, "boundary");
+    if (!b || !(b = strchr(b, '='))) return 0;
+    b++;
+    size_t n;
+    if (*b == '"') {
+        b++;
+        const char* e = strchr(b, '"');
+        if (!e) return 0;
+        n = (size_t)(e - b);
+    } else {
+        n = strcspn(b, ",;");
+    }
+    if (n == 0 || n > 200 || n + 1 > outsz) return 0;
+    memcpy(out, b, n);
+    out[n] = 0;
+    return 1;
+}
+
+/* Parse a multipart/form-data body (RFC 7578) into $_POST and $_FILES.
+   Works on lengths, never on C-string functions, because file data is
+   binary and NUL bytes are normal in it. Every way the body can be wrong --
+   no closing boundary, headers that never end, a part with no name -- stops
+   or skips cleanly; the bytes are the visitor's, not ours. */
+static void parse_multipart(const char* body, size_t n, const char* boundary, Value* post) {
+    char delim[256];
+    size_t dl = (size_t)snprintf(delim, sizeof delim, "--%s", boundary);
+    char next_delim[260];
+    size_t ndl = (size_t)snprintf(next_delim, sizeof next_delim, "\n--%s", boundary);
+
+    long long upload_max = env_size("PHPMINI_UPLOAD_MAX_FILESIZE", 2LL << 20);
+    long long max_files = env_size("PHPMINI_MAX_FILE_UPLOADS", 20);
+    long long form_max = 0;                  /* the MAX_FILE_SIZE form field */
+    long vars_used = 0;
+    long long files_seen = 0;
+    int warned_files = 0;
+    int anon_index = 0;
+
+    const char* end = body + n;
+    /* the first boundary sits at the very start or at the start of a line */
+    const char* hit = 0;
+    for (const char* p = body; p < end; ) {
+        const char* m = memmem(p, (size_t)(end - p), delim, dl);
+        if (!m) break;
+        if (m == body || m[-1] == '\n') { hit = m; break; }
+        p = m + 1;
+    }
+
+    while (hit) {
+        const char* p = hit + dl;
+        if (end - p >= 2 && p[0] == '-' && p[1] == '-') break;    /* closing */
+        const char* nl = memchr(p, '\n', (size_t)(end - p));
+        if (!nl) break;
+        p = nl + 1;
+
+        /* part headers, up to the empty line; 16 KB is generous */
+        char* disp = 0;
+        char* ctype = 0;
+        const char* hstart = p;
+        int headers_ok = 0;
+        int ran_out = 1;                /* stopped because the body ended */
+        while (p < end) {
+            const char* le = memchr(p, '\n', (size_t)(end - p));
+            if (!le) break;
+            if (le - hstart > 16384) { ran_out = 0; break; }
+            size_t ll = (size_t)(le - p);
+            if (ll && p[ll - 1] == '\r') ll--;
+            if (ll == 0) { p = le + 1; headers_ok = 1; break; }
+            char* line = malloc(ll + 1);
+            memcpy(line, p, ll);
+            line[ll] = 0;
+            if (!strncasecmp(line, "Content-Disposition:", 20)) { free(disp); disp = line; }
+            else if (!strncasecmp(line, "Content-Type:", 13)) { free(ctype); ctype = line; }
+            else free(line);
+            p = le + 1;
+        }
+        if (!headers_ok) {
+            /* Headers that run off the END of the body still describe a
+               part -- PHP registers such a file as UPLOAD_ERR_PARTIAL. An
+               oversized header block is garbage, and parsing stops. */
+            if (!ran_out) { free(disp); free(ctype); break; }
+            p = end;
+        }
+
+        /* the data runs to the next delimiter line */
+        const char* nx = memmem(p, (size_t)(end - p), next_delim, ndl);
+        const char* data_end = nx ? nx : end;
+        if (nx && data_end > p && data_end[-1] == '\r') data_end--;
+        size_t len = (size_t)(data_end - p);
+
+        char* name = disp ? header_param(disp, "name") : 0;
+        char* fname = disp ? header_param(disp, "filename") : 0;
+        char* type = 0;
+        if (ctype) {
+            const char* tv = ctype + 13;
+            while (*tv == ' ' || *tv == '\t') tv++;
+            type = xstrdup(tv);
+        }
+
+        if (!name && !fname) {
+            /* neither a name nor a filename: PHP calls this garbled and
+               stops reading the body here */
+            fprintf(stderr, "PHP warning: File Upload Mime headers garbled\n");
+            free(type); free(disp); free(ctype);
+            break;
+        }
+        if (!name && fname) {
+            /* a file part with no name gets PHP's "anonymous" index */
+            char an[32];
+            snprintf(an, sizeof an, "%d", anon_index++);
+            name = xstrdup(an);
+        }
+
+        if (name && *name) {
+            if (!fname) {
+                if (input_vars_ok(&vars_used, "the form body")) {
+                    Value* v = v_str_n(p, len);
+                    if (!strcmp(name, "MAX_FILE_SIZE")) form_max = val_to_int(v);
+                    register_variable(post, name, v);
+                }
+            } else if (++files_seen > max_files && max_files > 0) {
+                if (!warned_files++)
+                    fprintf(stderr, "PHP warning: Maximum number of allowable file uploads "
+                                    "has been exceeded\n");
+            } else {
+                char tmp[1024] = "";
+                int err;
+                long long size = (long long)len;
+                if (!*fname)                                   err = UPLOAD_ERR_NO_FILE;
+                else if (!nx)                                  err = UPLOAD_ERR_PARTIAL;
+                else if (upload_max > 0 && size > upload_max)  err = UPLOAD_ERR_INI_SIZE;
+                else if (form_max > 0 && size > form_max)      err = UPLOAD_ERR_FORM_SIZE;
+                else err = store_upload(p, len, tmp, sizeof tmp);
+                /* an upload that failed reports no tmp file, size 0 and an
+                   empty type -- what the browser claimed is not echoed back
+                   for a file that never arrived */
+                if (err != UPLOAD_ERR_OK) { tmp[0] = 0; size = 0; }
+                register_file(name, fname, err == UPLOAD_ERR_OK && type ? type : "", tmp, err, size);
+            }
+        }
+        free(name);
+        free(fname);
+        free(type);
+        free(disp);
+        free(ctype);
+
+        if (!nx) break;                                    /* body ended early */
+        hit = nx + 1;                                      /* at "--boundary" */
+    }
+}
+
 static void read_post_into(Value* dest) {
     const char* cl = getenv("CONTENT_LENGTH");
-    long len = cl ? strtol(cl, 0, 10) : 0;
-
+    long long len = cl ? strtoll(cl, 0, 10) : 0;
     if (len <= 0) return;
-    if (len > 2 * 1024 * 1024) len = 2 * 1024 * 1024;
 
-    char* body = malloc((size_t)len + 1);
-    if (!body) fatal("out of memory");
+    /* post_max_size, PHP's 8 MB default. A body over it is NOT read at all
+       and $_POST/$_FILES stay empty -- PHP's behaviour, and the reason the
+       limit protects anything: reading it first would already have cost the
+       memory. (This replaces the old fixed 2 MB cap.) */
+    long long post_max = env_size("PHPMINI_POST_MAX_SIZE", 8LL << 20);
+    if (post_max > 0 && len > post_max) {
+        fprintf(stderr, "PHP warning: POST Content-Length of %lld bytes exceeds the limit "
+                        "of %lld bytes\n", len, post_max);
+        return;
+    }
 
-    size_t got = fread(body, 1, (size_t)len, stdin);
+    /* Grow the buffer as bytes ARRIVE instead of allocating what the
+       Content-Length header claims. The header is the visitor's word: with
+       post_max_size set to unlimited, "Content-Length: 1000000000000" used to
+       make the process try to allocate a terabyte before reading a byte. Now
+       memory follows the data actually received. */
+    size_t cap = (size_t)(len < 65536 ? len : 65536) + 1;
+    size_t got = 0;
+    char* body = malloc(cap);
+    while (got < (size_t)len) {
+        if (got + 1 >= cap) {
+            size_t want = cap * 2;
+            if (want > (size_t)len + 1) want = (size_t)len + 1;
+            body = realloc(body, want);
+            cap = want;
+        }
+        size_t room = cap - 1 - got;
+        size_t chunk = (size_t)len - got < room ? (size_t)len - got : room;
+        size_t r = fread(body + got, 1, chunk, stdin);
+        if (r == 0) break;                    /* the body ended early */
+        got += r;
+    }
     body[got] = 0;
 
     const char* ct = getenv("CONTENT_TYPE");
-
-    if (!ct || strncasecmp(ct, "application/x-www-form-urlencoded", 33) == 0)
+    if (!ct || strncasecmp(ct, "application/x-www-form-urlencoded", 33) == 0) {
         parse_urlencoded_into(body, dest);
+    } else if (strncasecmp(ct, "multipart/form-data", 19) == 0) {
+        char boundary[256];
+        if (multipart_boundary(ct, boundary, sizeof boundary))
+            parse_multipart(body, got, boundary, dest);
+        else
+            fprintf(stderr, "PHP warning: Missing boundary in multipart/form-data POST data\n");
+    }
 
     free(body);
 }
@@ -2922,6 +3374,7 @@ static void copy_array(Value* dest, Value* src) {
 static void web_atexit(void) {
     save_session_file();
     flush_response();
+    cleanup_uploads();       /* uploads the script did not move are deleted */
 }
 
 /* AUDIT: max_execution_time.
@@ -2987,6 +3440,7 @@ static void apply_memory_limit(void) {
 static void web_bootstrap(Env* env) {
     V_GET = v_new(T_ARRAY);
     V_POST = v_new(T_ARRAY);
+    V_FILES = v_new(T_ARRAY);
     V_COOKIE = v_new(T_ARRAY);
     V_SESSION = v_new(T_ARRAY);
     V_SERVER = v_new(T_ARRAY);
@@ -2994,6 +3448,7 @@ static void web_bootstrap(Env* env) {
 
     env_set(env, "_GET", V_GET);
     env_set(env, "_POST", V_POST);
+    env_set(env, "_FILES", V_FILES);
     env_set(env, "_COOKIE", V_COOKIE);
     env_set(env, "_SESSION", V_SESSION);
     env_set(env, "_SERVER", V_SERVER);
@@ -3199,6 +3654,82 @@ static Value* builtin(const char* name, Value** args, int argc) {
         NEED(1);
         if (args[0]->type == T_ARRAY) return v_int(array_count(args[0]));
         return v_int(args[0]->type == T_NULL ? 0 : 1);
+    }
+
+    /* ---------- uploads (milestone 4) ---------- */
+
+    if (!strcmp(name, "is_uploaded_file")) {
+        NEED(1);
+        char* path = val_to_string(args[0]);
+        int ok = find_upload(path) >= 0;
+        free(path);
+        return v_bool(ok);
+    }
+
+    if (!strcmp(name, "move_uploaded_file")) {
+        NEED(2);
+        /* Only a file that arrived in THIS request -- anything else is
+           refused with false and no warning, exactly as PHP does. */
+        char* from = val_to_string(args[0]);
+        char* to = val_to_string(args[1]);
+        int idx = find_upload(from);
+        int ok = 0;
+        if (idx >= 0) {
+            if (rename(from, to) == 0) {
+                ok = 1;
+            } else if (errno == EXDEV) {
+                /* a different filesystem: copy, then remove the temp file */
+                int in = open(from, O_RDONLY);
+                int out = in >= 0 ? open(to, O_WRONLY | O_CREAT | O_TRUNC, 0666) : -1;
+                if (in >= 0 && out >= 0) {
+                    char buf[65536];
+                    ssize_t r;
+                    ok = 1;
+                    while ((r = read(in, buf, sizeof buf)) > 0)
+                        if (write(out, buf, (size_t)r) != r) { ok = 0; break; }
+                    if (r < 0) ok = 0;
+                }
+                if (in >= 0) close(in);
+                if (out >= 0) close(out);
+                if (ok) unlink(from); else if (out >= 0) unlink(to);
+            }
+            if (ok) {
+                /* the temp file was private (0600); a moved upload gets the
+                   normal permissions, 0666 less the umask, as in PHP */
+                mode_t um = umask(0);
+                umask(um);
+                chmod(to, 0666 & ~um);
+                up_moved[idx] = 1;
+            } else {
+                fprintf(stderr, "PHP warning: move_uploaded_file(): Unable to move \"%s\" to \"%s\"\n", from, to);
+            }
+        }
+        free(from);
+        free(to);
+        return v_bool(ok);
+    }
+
+    if (!strcmp(name, "basename")) {
+        NEED(1);
+        /* POSIX basename as PHP does it on Linux: trailing slashes dropped,
+           the last component kept, and an optional suffix removed unless
+           it is the whole name. */
+        char* path = val_to_string(args[0]);
+        size_t n = strlen(path);
+        while (n > 1 && path[n - 1] == '/') n--;
+        if (n == 1 && path[0] == '/') n = 0;
+        size_t st = n;
+        while (st > 0 && path[st - 1] != '/') st--;
+        size_t bl = n - st;
+        if (argc > 1) {
+            char* suf = val_to_string(args[1]);
+            size_t sl = strlen(suf);
+            if (sl && sl < bl && !memcmp(path + st + bl - sl, suf, sl)) bl -= sl;
+            free(suf);
+        }
+        Value* r = v_str_n(path + st, bl);
+        free(path);
+        return r;
     }
 
     /* ---------- strings (milestone 2) ----------
@@ -3969,7 +4500,7 @@ static long long array_next_index(Value* arr) {
    which is where login code lives, so sessions were effectively broken for
    real applications even after the file format was fixed. */
 static int is_superglobal(const char* name) {
-    static const char* sg[] = { "_GET", "_POST", "_COOKIE", "_SESSION", "_SERVER", "_REQUEST", 0 };
+    static const char* sg[] = { "_GET", "_POST", "_COOKIE", "_SESSION", "_SERVER", "_REQUEST", "_FILES", 0 };
     for (int i = 0; sg[i]; i++) if (!strcmp(name, sg[i])) return 1;
     return 0;
 }
